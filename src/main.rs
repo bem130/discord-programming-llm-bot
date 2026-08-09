@@ -7,7 +7,9 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let _config = Config::from_env().context("invalid application configuration")?;
-    tracing::info!("configuration loaded; bot startup will be wired in the next implementation step");
+    tracing::info!(
+        "configuration loaded; bot startup will be wired in the next implementation step"
+    );
     Ok(())
 }
 
@@ -20,4 +22,3 @@ fn init_tracing() {
         .with_target(false)
         .init();
 }
-

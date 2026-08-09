@@ -61,4 +61,3 @@ mod tests {
         assert_eq!(DEFAULT_OPENROUTER_BASE_URL, "https://openrouter.ai/api/v1");
     }
 }
-
