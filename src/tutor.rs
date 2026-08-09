@@ -12,6 +12,7 @@ use crate::{
     },
     context::{
         RuntimeContext, context_data_message, context_text_data_message, conversation_prompt,
+        reply_decision_context_message,
     },
     db::Database,
     model::{ChannelMode, ContextMessage, GuildMemory, MemoryKind, MemoryStatus},
@@ -83,7 +84,7 @@ fn reply_decision_request(
     ModelRequest::json(
         vec![
             PromptMessage::system(REPLY_DECISION_PROMPT),
-            context_text_data_message(context),
+            reply_decision_context_message(context),
             PromptMessage::user(format!(
                 "このサーバーで利用可能なカスタム絵文字: {}",
                 available_custom_emojis
