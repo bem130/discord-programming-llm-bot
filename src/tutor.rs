@@ -415,7 +415,7 @@ fn conversation_search_tool() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "search_conversation_history",
-            "description": "許可済みチャンネルから保存されたこのDiscordサーバーの全会話と抽出済み添付テキストを検索する。直近コンテキストにない過去の決定や発言を確認する場合に使う。例: pattern='Result|Option', regex=true。正規表現はRust regex構文で、結果は新しい順に最大20件。",
+            "description": "許可済みチャンネルから保存されたこのDiscordサーバーの全会話と抽出済み添付テキストを検索する。通常promptは直近5メッセージだけなので、過去への言及、以前の決定、別チャンネルの話題、前提不足を検出したら回答前に自発的に使う。例: pattern='Result|Option', regex=true。正規表現はRust regex構文で、結果は新しい順に最大20件。",
             "parameters": {
                 "type": "object",
                 "properties": {

@@ -33,7 +33,7 @@ use crate::{
     tutor::{decide_action, generate_reviewed_answer},
 };
 
-const CONTEXT_MESSAGE_LIMIT: u32 = 40;
+const RECENT_CONTEXT_MESSAGE_LIMIT: u32 = 5;
 const MAX_TEXT_ATTACHMENT_BYTES: u32 = 512 * 1024;
 const MAX_MULTIMODAL_ATTACHMENT_BYTES: u32 = 20 * 1024 * 1024;
 const TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
@@ -252,7 +252,7 @@ impl DiscordBot {
         let _response_guard = self.response_lock.lock().await;
         let guild_context = self
             .database
-            .recent_context(self.guild_id.get(), CONTEXT_MESSAGE_LIMIT)
+            .recent_context(self.guild_id.get(), RECENT_CONTEXT_MESSAGE_LIMIT)
             .await?;
         let bot_user_id = self.bot_user_id.load(Ordering::Relaxed);
         let user_mentioned = bot_user_id != 0
