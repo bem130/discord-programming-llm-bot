@@ -11,3 +11,12 @@
 JSONのみを返してください:
 {"approved": true または false, "feedback": "不承認なら具体的な修正指示。承認なら短い理由"}
 
+出力例:
+
+```json
+{"approved":true,"feedback":"質問へ直接答えており、コードと説明もDiscordで利用可能"}
+```
+
+```json
+{"approved":false,"feedback":"Markdown表とLaTeX数式を箇条書きとプレーンテキストへ変更し、未確認のライブラリ仕様には公式資料の根拠を付ける"}
+```

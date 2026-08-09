@@ -13,6 +13,10 @@ pub struct Config {
     pub openrouter_model: String,
     pub openrouter_base_url: String,
     pub database_url: String,
+    pub code_runner_enabled: bool,
+    pub lima_instance: String,
+    pub lima_template: String,
+    pub code_execution_timeout_secs: u64,
 }
 
 impl Config {
@@ -31,7 +35,32 @@ impl Config {
             openrouter_base_url: optional("OPENROUTER_BASE_URL")
                 .unwrap_or_else(|| DEFAULT_OPENROUTER_BASE_URL.to_owned()),
             database_url: required("DATABASE_URL")?,
+            code_runner_enabled: optional("CODE_RUNNER_ENABLED")
+                .map(|value| parse_bool("CODE_RUNNER_ENABLED", &value))
+                .transpose()?
+                .unwrap_or(false),
+            lima_instance: optional("LIMA_INSTANCE")
+                .unwrap_or_else(|| "discord-code-runner".to_owned()),
+            lima_template: optional("LIMA_TEMPLATE")
+                .unwrap_or_else(|| "src/runner/lima.yaml".to_owned()),
+            code_execution_timeout_secs: optional("CODE_EXECUTION_TIMEOUT_SECS")
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| ConfigError::InvalidInteger("CODE_EXECUTION_TIMEOUT_SECS"))
+                })
+                .transpose()?
+                .unwrap_or(20)
+                .clamp(1, 120),
         })
+    }
+}
+
+fn parse_bool(name: &'static str, value: &str) -> Result<bool, ConfigError> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(ConfigError::InvalidBoolean(name)),
     }
 }
 
@@ -49,6 +78,10 @@ pub enum ConfigError {
     Missing(&'static str),
     #[error("DISCORD_GUILD_ID must be a non-zero integer")]
     InvalidGuildId,
+    #[error("{0} must be a boolean")]
+    InvalidBoolean(&'static str),
+    #[error("{0} must be an integer")]
+    InvalidInteger(&'static str),
 }
 
 #[cfg(test)]

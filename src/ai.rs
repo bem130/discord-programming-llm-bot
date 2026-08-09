@@ -11,30 +11,63 @@ const OPENROUTER_TITLE: &str = "Discord Learn Programming Bot";
 #[derive(Debug, Clone, Serialize)]
 pub struct PromptMessage {
     pub role: PromptRole,
-    pub content: String,
+    pub content: PromptContent,
 }
 
 impl PromptMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: PromptRole::System,
-            content: content.into(),
+            content: PromptContent::Text(content.into()),
         }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: PromptRole::User,
-            content: content.into(),
+            content: PromptContent::Text(content.into()),
         }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: PromptRole::Assistant,
-            content: content.into(),
+            content: PromptContent::Text(content.into()),
         }
     }
+
+    pub fn user_parts(parts: Vec<ContentPart>) -> Self {
+        Self {
+            role: PromptRole::User,
+            content: PromptContent::Parts(parts),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum PromptContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+    File { file: FileInput },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageUrl {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileInput {
+    pub filename: String,
+    pub file_data: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -50,6 +83,7 @@ pub struct ModelRequest {
     pub messages: Vec<PromptMessage>,
     pub max_tokens: u32,
     pub response_schema: Option<JsonResponseSchema>,
+    pub web_search: bool,
 }
 
 impl ModelRequest {
@@ -58,6 +92,16 @@ impl ModelRequest {
             messages,
             max_tokens,
             response_schema: None,
+            web_search: false,
+        }
+    }
+
+    pub fn text_with_web_search(messages: Vec<PromptMessage>, max_tokens: u32) -> Self {
+        Self {
+            messages,
+            max_tokens,
+            response_schema: None,
+            web_search: true,
         }
     }
 
@@ -74,6 +118,7 @@ impl ModelRequest {
                 name: name.into(),
                 schema,
             }),
+            web_search: false,
         }
     }
 }
@@ -138,6 +183,16 @@ impl LanguageModel for OpenRouterClient {
             messages: &request.messages,
             max_tokens: request.max_tokens,
             response_format,
+            tools: request.web_search.then(|| {
+                vec![json!({
+                    "type": "openrouter:web_search",
+                    "parameters": {
+                        "max_results": 5,
+                        "max_total_results": 8,
+                        "search_context_size": "low"
+                    }
+                })]
+            }),
         };
 
         let response = self
@@ -157,14 +212,20 @@ impl LanguageModel for OpenRouterClient {
             .json()
             .await
             .context("invalid OpenRouter response")?;
-        let content = completion
+        let message = completion
             .choices
             .into_iter()
             .next()
-            .and_then(|choice| choice.message.content)
-            .filter(|content| !content.trim().is_empty());
-
-        content.context("OpenRouter returned no message content")
+            .map(|choice| choice.message)
+            .context("OpenRouter returned no choices")?;
+        let mut content = message
+            .content
+            .filter(|content| !content.trim().is_empty())
+            .context("OpenRouter returned no message content")?;
+        if request.web_search {
+            append_reference_links(&mut content, &message.annotations);
+        }
+        Ok(content)
     }
 }
 
@@ -188,6 +249,8 @@ struct ChatCompletionRequest<'a> {
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<Value>>,
 }
 
 #[derive(Deserialize)]
@@ -203,4 +266,44 @@ struct Choice {
 #[derive(Deserialize)]
 struct ResponseMessage {
     content: Option<String>,
+    #[serde(default)]
+    annotations: Vec<Annotation>,
+}
+
+#[derive(Deserialize)]
+struct Annotation {
+    #[serde(default)]
+    url_citation: Option<UrlCitation>,
+}
+
+#[derive(Deserialize)]
+struct UrlCitation {
+    url: String,
+    title: Option<String>,
+}
+
+fn append_reference_links(content: &mut String, annotations: &[Annotation]) {
+    let mut links: Vec<(String, String)> = Vec::new();
+    for annotation in annotations {
+        let Some(citation) = &annotation.url_citation else {
+            continue;
+        };
+        if links.iter().any(|(_, url)| url == &citation.url) {
+            continue;
+        }
+        links.push((
+            citation
+                .title
+                .clone()
+                .unwrap_or_else(|| citation.url.clone()),
+            citation.url.clone(),
+        ));
+    }
+    if links.is_empty() {
+        return;
+    }
+    content.push_str("\n\n参考リンク\n");
+    for (title, url) in links {
+        content.push_str(&format!("- [{title}]({url})\n"));
+    }
 }

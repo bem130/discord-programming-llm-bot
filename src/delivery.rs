@@ -1,7 +1,5 @@
-use unicode_segmentation::UnicodeSegmentation;
-
 pub const DISCORD_MESSAGE_LIMIT: usize = 2_000;
-pub const SAFE_MESSAGE_CHUNK_SIZE: usize = 1_800;
+pub const SAFE_MESSAGE_CHUNK_UTF16_UNITS: usize = 1_800;
 pub const SAFE_ATTACHMENT_PART_SIZE: usize = 24 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,7 +13,7 @@ pub fn split_message(content: &str) -> Vec<String> {
         return vec![];
     }
 
-    let raw_chunks = split_raw(content, SAFE_MESSAGE_CHUNK_SIZE);
+    let raw_chunks = split_raw(content, SAFE_MESSAGE_CHUNK_UTF16_UNITS);
     let mut code_fence: Option<String> = None;
     raw_chunks
         .into_iter()
@@ -59,23 +57,32 @@ pub fn split_attachment(filename: &str, bytes: &[u8]) -> Vec<AttachmentPart> {
         .collect()
 }
 
-fn split_raw(content: &str, max_graphemes: usize) -> Vec<String> {
-    let graphemes: Vec<&str> = UnicodeSegmentation::graphemes(content, true).collect();
+fn split_raw(content: &str, max_utf16_units: usize) -> Vec<String> {
+    let characters: Vec<char> = content.chars().collect();
     let mut chunks = Vec::new();
     let mut start = 0;
 
-    while start < graphemes.len() {
-        let hard_end = (start + max_graphemes).min(graphemes.len());
-        let end = if hard_end == graphemes.len() {
+    while start < characters.len() {
+        let mut hard_end = start;
+        let mut utf16_units = 0;
+        while hard_end < characters.len() {
+            let character_units = characters[hard_end].len_utf16();
+            if utf16_units + character_units > max_utf16_units {
+                break;
+            }
+            utf16_units += character_units;
+            hard_end += 1;
+        }
+        let end = if hard_end == characters.len() {
             hard_end
         } else {
             (start..hard_end)
                 .rev()
-                .find(|index| matches!(graphemes[*index], "\n" | " "))
+                .find(|index| matches!(characters[*index], '\n' | ' '))
                 .filter(|index| *index > start)
                 .map_or(hard_end, |index| index + 1)
         };
-        chunks.push(graphemes[start..end].concat());
+        chunks.push(characters[start..end].iter().collect());
         start = end;
     }
 
@@ -94,7 +101,9 @@ fn update_code_fence(chunk: &str, code_fence: &mut Option<String>) {
                         .split_whitespace()
                         .next()
                         .unwrap_or("```")
-                        .to_owned(),
+                        .chars()
+                        .take(64)
+                        .collect::<String>(),
                 );
             }
         }
@@ -125,7 +134,20 @@ mod tests {
         assert!(
             chunks
                 .iter()
-                .all(|chunk| chunk.graphemes(true).count() <= DISCORD_MESSAGE_LIMIT)
+                .all(|chunk| chunk.encode_utf16().count() <= DISCORD_MESSAGE_LIMIT)
+        );
+        assert_eq!(chunks.concat(), content);
+    }
+
+    #[test]
+    fn supplementary_unicode_is_counted_conservatively() {
+        let content = "🦀".repeat(2_000);
+        let chunks = split_message(&content);
+        assert!(chunks.len() > 1);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.encode_utf16().count() <= DISCORD_MESSAGE_LIMIT)
         );
         assert_eq!(chunks.concat(), content);
     }

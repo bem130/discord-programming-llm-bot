@@ -3,6 +3,8 @@ pub mod config;
 pub mod context;
 pub mod db;
 pub mod delivery;
+pub mod discord;
 pub mod model;
 pub mod review;
+pub mod runner;
 pub mod tutor;

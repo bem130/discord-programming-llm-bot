@@ -145,8 +145,8 @@ impl Database {
                 sqlx::query(
                     r#"
                     INSERT INTO message_attachments (
-                        message_id, filename, content_type, size_bytes, extracted_text
-                    ) VALUES (?, ?, ?, ?, ?)
+                        message_id, filename, content_type, size_bytes, extracted_text, binary_data
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     "#,
                 )
                 .bind(message_id)
@@ -154,6 +154,7 @@ impl Database {
                 .bind(&attachment.content_type)
                 .bind(i64::try_from(attachment.size_bytes).context("attachment is too large")?)
                 .bind(&attachment.extracted_text)
+                .bind(&attachment.binary_data)
                 .execute(&mut *transaction)
                 .await
                 .context("failed to store attachment metadata")?;
@@ -168,7 +169,7 @@ impl Database {
         let limit = limit.clamp(1, MAX_CONTEXT_MESSAGES);
         let rows = sqlx::query(
             r#"
-            SELECT id, channel_id, author_name, content, is_bot, created_at
+            SELECT id, channel_id, author_id, author_name, content, is_bot, created_at
             FROM messages
             WHERE guild_id = ?
             ORDER BY id DESC
@@ -185,7 +186,7 @@ impl Database {
         for row in rows.into_iter().rev() {
             let message_id: i64 = row.try_get("id")?;
             let attachment_rows = sqlx::query(
-                "SELECT filename, extracted_text FROM message_attachments WHERE message_id = ? ORDER BY id",
+                "SELECT filename, content_type, extracted_text, binary_data FROM message_attachments WHERE message_id = ? ORDER BY id",
             )
             .bind(message_id)
             .fetch_all(&self.pool)
@@ -193,6 +194,7 @@ impl Database {
 
             messages.push(ContextMessage {
                 channel_id: parse_id(row.try_get("channel_id")?)?,
+                author_id: parse_id(row.try_get("author_id")?)?,
                 author_name: row.try_get("author_name")?,
                 content: row.try_get("content")?,
                 is_bot: row.try_get("is_bot")?,
@@ -201,7 +203,9 @@ impl Database {
                     .into_iter()
                     .map(|attachment| ContextAttachment {
                         filename: attachment.get("filename"),
+                        content_type: attachment.get("content_type"),
                         extracted_text: attachment.get("extracted_text"),
+                        binary_data: attachment.get("binary_data"),
                     })
                     .collect(),
             });
@@ -265,6 +269,7 @@ mod tests {
                             content_type: Some("text/plain".into()),
                             size_bytes: 12,
                             extracted_text: Some("fn main() {}".into()),
+                            binary_data: None,
                         }]
                     } else {
                         vec![]

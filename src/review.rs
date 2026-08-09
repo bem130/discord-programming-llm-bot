@@ -84,9 +84,9 @@ async fn semantic_review(
     candidate: &str,
 ) -> Result<ReviewVerdict> {
     let mut messages = vec![PromptMessage::system(REVIEW_PROMPT)];
+    messages.extend_from_slice(original_messages);
     messages.push(PromptMessage::user(format!(
-        "元の会話:\n{}\n\n候補回答:\n<candidate>\n{candidate}\n</candidate>",
-        serialize_messages(original_messages)?
+        "上記が元の会話です。候補回答を審査してください。\n<candidate>\n{candidate}\n</candidate>"
     )));
 
     complete_json(
@@ -116,25 +116,17 @@ async fn repair(
     candidate: &str,
     feedback: &str,
 ) -> Result<String> {
+    let mut messages = vec![PromptMessage::system(
+        "候補回答を修正する編集者です。修正済み回答だけを返してください。",
+    )];
+    messages.extend_from_slice(original_messages);
+    messages.push(PromptMessage::user(format!(
+        "上記が元の会話です。\n\n候補回答:\n<candidate>\n{candidate}\n</candidate>\n\n修正指示:\n{feedback}"
+    )));
     model
-        .complete(ModelRequest::text(
-            vec![
-                PromptMessage::system(
-                    "候補回答を修正する編集者です。修正済み回答だけを返してください。",
-                ),
-                PromptMessage::user(format!(
-                    "元の会話:\n{}\n\n候補回答:\n<candidate>\n{candidate}\n</candidate>\n\n修正指示:\n{feedback}",
-                    serialize_messages(original_messages)?
-                )),
-            ],
-            4_000,
-        ))
+        .complete(ModelRequest::text(messages, 4_000))
         .await
         .context("AI response repair failed")
-}
-
-fn serialize_messages(messages: &[PromptMessage]) -> Result<String> {
-    serde_json::to_string(messages).context("failed to serialize review context")
 }
 
 fn looks_like_table_separator(line: &str) -> bool {

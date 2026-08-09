@@ -78,6 +78,7 @@ pub struct IncomingAttachment {
     pub content_type: Option<String>,
     pub size_bytes: u64,
     pub extracted_text: Option<String>,
+    pub binary_data: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +97,7 @@ pub struct IncomingMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextMessage {
     pub channel_id: u64,
+    pub author_id: u64,
     pub author_name: String,
     pub content: String,
     pub is_bot: bool,
@@ -106,7 +108,9 @@ pub struct ContextMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextAttachment {
     pub filename: String,
+    pub content_type: Option<String>,
     pub extracted_text: Option<String>,
+    pub binary_data: Option<Vec<u8>>,
 }
 
 #[cfg(test)]
