@@ -205,6 +205,9 @@ async fn generate_with_tools(
             .with_tool(conversation_search_tool())
             .with_tool(memory_details_tool())
             .with_tool(memory_candidate_tool())
+            .with_tool(channel_recent_messages_tool())
+            .with_tool(explain_compiler_error_tool())
+            .with_tool(format_and_lint_code_tool())
             .with_guild_session(runtime_context.server.id, AiSessionPurpose::Conversation);
         if runner.is_some() {
             request = request.with_tool(code_execution_tool());
@@ -342,6 +345,155 @@ async fn execute_local_tool(
                 "timed_out": result.timed_out,
                 "output": result.output
             }))
+        }
+        "get_channel_recent_messages" => {
+            #[derive(Deserialize)]
+            struct ChannelRecentArgs {
+                channel_id: Option<u64>,
+                channel_name: Option<String>,
+                limit: Option<u32>,
+            }
+            let args: ChannelRecentArgs = serde_json::from_str(arguments)
+                .context("invalid get_channel_recent_messages arguments")?;
+            let channel_id = match args.channel_id {
+                Some(id) => id,
+                None => {
+                    let name = args
+                        .channel_name
+                        .context("either channel_id or channel_name is required")?;
+                    database
+                        .find_channel_id_by_name(runtime_context.server.id, &name)
+                        .await?
+                        .with_context(|| format!("channel not found: {name}"))?
+                }
+            };
+            let limit = args.limit.unwrap_or(10).clamp(1, 20);
+            let messages = database
+                .recent_channel_context(runtime_context.server.id, channel_id, limit)
+                .await?;
+            Ok(json!({
+                "ok": true,
+                "channel_id": channel_id,
+                "count": messages.len(),
+                "messages": messages.iter().map(|m| json!({
+                    "message_id": m.message_id,
+                    "author_id": m.author_id,
+                    "author_name": m.author_name,
+                    "content": m.content,
+                    "is_bot": m.is_bot,
+                    "created_at": m.created_at,
+                    "reply_to": m.reply_to,
+                    "linked_messages": m.linked_messages,
+                    "attachment_count": m.attachments.len()
+                })).collect::<Vec<_>>()
+            }))
+        }
+        "explain_compiler_error" => {
+            #[derive(Deserialize)]
+            struct ExplainArgs {
+                language: String,
+                code: String,
+            }
+            let args: ExplainArgs = serde_json::from_str(arguments)
+                .context("invalid explain_compiler_error arguments")?;
+            let code = args.code.trim().to_owned();
+            anyhow::ensure!(!code.is_empty(), "error code must not be empty");
+            anyhow::ensure!(code.len() <= 64, "error code too long");
+            let explanation = match args.language.to_lowercase().as_str() {
+                "rust" => {
+                    let result = tokio::process::Command::new("rustc")
+                        .args(["--explain", &code])
+                        .output()
+                        .await
+                        .context("failed to run rustc --explain")?;
+                    let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
+                    let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+                    if result.status.success() && !stdout.trim().is_empty() {
+                        stdout
+                    } else if !stderr.trim().is_empty() {
+                        return Ok(json!({ "ok": false, "error": stderr.trim() }));
+                    } else {
+                        return Ok(
+                            json!({ "ok": false, "error": format!("No explanation found for {code}") }),
+                        );
+                    }
+                }
+                lang => {
+                    return Ok(json!({
+                        "ok": false,
+                        "error": format!("explain_compiler_error does not yet support language: {lang}")
+                    }));
+                }
+            };
+            Ok(json!({
+                "ok": true,
+                "language": args.language,
+                "code": code,
+                "explanation": explanation.trim()
+            }))
+        }
+        "format_and_lint_code" => {
+            #[derive(Deserialize)]
+            struct FormatArgs {
+                language: String,
+                code: String,
+            }
+            let args: FormatArgs = serde_json::from_str(arguments)
+                .context("invalid format_and_lint_code arguments")?;
+            anyhow::ensure!(!args.code.is_empty(), "code must not be empty");
+            anyhow::ensure!(args.code.len() <= 64_000, "code is too long");
+            match args.language.to_lowercase().as_str() {
+                "rust" => {
+                    let mut child = tokio::process::Command::new("rustfmt")
+                        .args(["--edition", "2021", "--emit", "stdout"])
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                        .context("failed to spawn rustfmt")?;
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use tokio::io::AsyncWriteExt;
+                        stdin
+                            .write_all(args.code.as_bytes())
+                            .await
+                            .context("failed to write to rustfmt stdin")?;
+                    }
+                    let output = child.wait_with_output().await.context("rustfmt failed")?;
+                    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                    Ok(json!({
+                        "ok": output.status.success(),
+                        "formatted_code": stdout.trim(),
+                        "diagnostics": stderr.trim()
+                    }))
+                }
+                "python" | "python3" => {
+                    let tmp = std::env::temp_dir().join("format_check.py");
+                    tokio::fs::write(&tmp, &args.code)
+                        .await
+                        .context("failed to write temp file")?;
+                    let result = tokio::process::Command::new("python3")
+                        .args([
+                            "-m",
+                            "py_compile",
+                            tmp.to_str().unwrap_or("format_check.py"),
+                        ])
+                        .output()
+                        .await
+                        .context("failed to run python3 -m py_compile")?;
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+                    Ok(json!({
+                        "ok": result.status.success(),
+                        "formatted_code": args.code,
+                        "diagnostics": stderr.trim()
+                    }))
+                }
+                lang => Ok(json!({
+                    "ok": false,
+                    "error": format!("format_and_lint_code does not yet support language: {lang}")
+                })),
+            }
         }
         _ => Err(anyhow!("unknown local tool: {name}")),
     }
@@ -493,7 +645,7 @@ fn code_execution_tool() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "execute_code_in_sandbox",
-            "description": "隔離されたLima VM環境でコード（Rust, Python, C/C++, Go等）をコンパイル・実行する。コードの動作検証、コンパイルエラー確認、標準出力の取得が必要な場合に使用する。",
+            "description": "隔離されたLima VM環境でコードをコンパイル・実行する。コードの動作検証、コンパイルエラー確認、標準出力の取得が必要な場合に使用する。対応言語: Rust, Python, C/C++, Go, Haskell (ghc), OCaml, Lean 4 (lean/lake; ~/.elan/env を source すること), Coq, Elm 0.19.1, Common Lisp (sbcl), Lazy-K (lazyk) 等。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -524,6 +676,63 @@ fn code_execution_tool() -> serde_json::Value {
                     }
                 },
                 "required": ["execute", "explanation", "system_packages", "files", "commands"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn channel_recent_messages_tool() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "get_channel_recent_messages",
+            "description": "指定したDiscordチャンネルの直近メッセージを取得する。別チャンネルの最新の議論状況や文脈確認が必要な場合に使用する。channel_idまたはchannel_nameのいずれかを指定すること。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_id": { "type": "integer", "description": "取得するDiscordチャンネルID（数値）" },
+                    "channel_name": { "type": "string", "description": "チャンネル名（例: 'questions', 'pair-programming'）。channel_idが不明な場合に使用" },
+                    "limit": { "type": "integer", "description": "取得するメッセージ件数（1〜20、デフォルト10）" }
+                },
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn explain_compiler_error_tool() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "explain_compiler_error",
+            "description": "コンパイラのエラーコードの公式解説をローカルで取得する。Rustの E0382 のようなエラーコードの意味・原因・解決策を正確に調べたいときに使用する。Web検索より高速・確実。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "language": { "type": "string", "description": "プログラミング言語名（現在は 'rust' のみ対応）" },
+                    "code": { "type": "string", "description": "エラーコード（例: 'E0382', 'E0308'）" }
+                },
+                "required": ["language", "code"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn format_and_lint_code_tool() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "format_and_lint_code",
+            "description": "コードの整形（フォーマット）と構文チェックをホスト上で高速実行する。VM起動なしにミリ秒単位で結果を返す。対応言語: rust（rustfmt使用）, python/python3（py_compile使用）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "language": { "type": "string", "description": "言語名（'rust', 'python', 'python3'）" },
+                    "code": { "type": "string", "description": "整形・チェック対象のソースコード" }
+                },
+                "required": ["language", "code"],
                 "additionalProperties": false
             }
         }

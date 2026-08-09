@@ -263,7 +263,19 @@ if (-not $SkipVmStart) {
     }
 
     & $limaExecutable --tty=false shell $InstanceName bash -lc `
-        'set -euo pipefail; rustc --version; cargo --version; gcc --version | head -n 1; python3 --version'
+        'set -euo pipefail
+         source "$HOME/.elan/env" 2>/dev/null || true
+         rustc --version
+         cargo --version
+         gcc --version | head -n 1
+         python3 --version
+         ghc --version | head -n 1
+         ocaml --version
+         coq --version | head -n 1
+         sbcl --version | head -n 1
+         elm --version
+         lazyk --version 2>&1 || lazyk 2>&1 | head -n 1 || true
+         lean --version'
     if ($LASTEXITCODE -ne 0) {
         throw "The Lima instance failed its toolchain smoke test: $InstanceName"
     }

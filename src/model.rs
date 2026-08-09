@@ -183,6 +183,17 @@ pub struct ChannelSetting {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferencedMessage {
+    pub message_id: u64,
+    pub channel_id: u64,
+    pub author_id: u64,
+    pub author_name: String,
+    pub content: String,
+    pub is_bot: bool,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncomingAttachment {
     pub filename: String,
@@ -204,6 +215,8 @@ pub struct IncomingMessage {
     pub content: String,
     pub is_bot: bool,
     pub created_at: String,
+    pub referenced_message_id: Option<u64>,
+    pub referenced_message: Option<ReferencedMessage>,
     pub attachments: Vec<IncomingAttachment>,
 }
 
@@ -217,12 +230,15 @@ pub struct RecentChannelActivity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextMessage {
+    pub message_id: u64,
     pub channel_id: u64,
     pub author_id: u64,
     pub author_name: String,
     pub content: String,
     pub is_bot: bool,
     pub created_at: String,
+    pub reply_to: Option<ReferencedMessage>,
+    pub linked_messages: Vec<ReferencedMessage>,
     pub attachments: Vec<ContextAttachment>,
 }
 

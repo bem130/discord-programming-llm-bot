@@ -51,13 +51,22 @@ pub struct RuntimeUser {
     pub display_name: String,
 }
 
+fn is_slice_empty<T>(slice: &[T]) -> bool {
+    slice.is_empty()
+}
+
 #[derive(Serialize)]
 struct SafeContextMessage<'a> {
+    message_id: u64,
     channel_id: u64,
     author_id: u64,
     author: &'a str,
     role: &'static str,
     content: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_to: Option<&'a crate::model::ReferencedMessage>,
+    #[serde(skip_serializing_if = "is_slice_empty")]
+    linked_messages: &'a [crate::model::ReferencedMessage],
     attachments: Vec<SafeAttachment<'a>>,
     created_at: &'a str,
 }
@@ -72,11 +81,16 @@ struct SafeAttachment<'a> {
 
 #[derive(Serialize)]
 struct ReplyDecisionContextMessage<'a> {
+    message_id: u64,
     channel_id: u64,
     author_id: u64,
     author: &'a str,
     role: &'static str,
     content: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_to: Option<&'a crate::model::ReferencedMessage>,
+    #[serde(skip_serializing_if = "is_slice_empty")]
+    linked_messages: &'a [crate::model::ReferencedMessage],
     attachment_count: usize,
     has_code_attachment: bool,
     code_attachment_line_counts: Vec<usize>,
@@ -203,11 +217,14 @@ pub fn reply_decision_context_message(context: &[ContextMessage]) -> PromptMessa
                 })
                 .collect();
             ReplyDecisionContextMessage {
+                message_id: message.message_id,
                 channel_id: message.channel_id,
                 author_id: message.author_id,
                 author: &message.author_name,
                 role: if message.is_bot { "assistant" } else { "user" },
                 content: &message.content,
+                reply_to: message.reply_to.as_ref(),
+                linked_messages: &message.linked_messages,
                 attachment_count: message.attachments.len(),
                 has_code_attachment: !code_attachment_line_counts.is_empty(),
                 other_attachment_count: message
@@ -229,11 +246,14 @@ fn serialize_safe_context(context: &[ContextMessage]) -> String {
     let safe_context: Vec<_> = context
         .iter()
         .map(|message| SafeContextMessage {
+            message_id: message.message_id,
             channel_id: message.channel_id,
             author_id: message.author_id,
             author: &message.author_name,
             role: if message.is_bot { "assistant" } else { "user" },
             content: &message.content,
+            reply_to: message.reply_to.as_ref(),
+            linked_messages: &message.linked_messages,
             attachments: message
                 .attachments
                 .iter()
@@ -300,12 +320,15 @@ mod tests {
     #[test]
     fn image_is_embedded_as_data_url() {
         let context = vec![ContextMessage {
+            message_id: 100,
             channel_id: 10,
             author_id: 20,
             author_name: "learner".into(),
             content: "このエラーは何？".into(),
             is_bot: false,
             created_at: "2026-08-09T00:00:00Z".into(),
+            reply_to: None,
+            linked_messages: vec![],
             attachments: vec![ContextAttachment {
                 filename: "error.png".into(),
                 content_type: Some("image/png".into()),
@@ -369,12 +392,15 @@ mod tests {
     fn reply_decision_uses_only_five_messages_and_attachment_counts() {
         let context: Vec<_> = (0..6)
             .map(|index| ContextMessage {
+                message_id: 100 + index,
                 channel_id: 10,
                 author_id: 20,
                 author_name: "learner".into(),
                 content: format!("message-{index}"),
                 is_bot: false,
                 created_at: "2026-08-09T00:00:00Z".into(),
+                reply_to: None,
+                linked_messages: vec![],
                 attachments: if index == 5 {
                     vec![
                         ContextAttachment {
@@ -408,5 +434,44 @@ mod tests {
         assert!(text.contains(r#""has_code_attachment":true"#));
         assert!(text.contains(r#""code_attachment_line_counts":[3]"#));
         assert!(text.contains(r#""other_attachment_count":1"#));
+    }
+
+    #[test]
+    fn context_message_includes_reply_to_and_linked_messages() {
+        use crate::model::ReferencedMessage;
+
+        let context = vec![ContextMessage {
+            message_id: 200,
+            channel_id: 10,
+            author_id: 20,
+            author_name: "learner".into(),
+            content: "リンクと返信".into(),
+            is_bot: false,
+            created_at: "2026-08-09T00:00:00Z".into(),
+            reply_to: Some(ReferencedMessage {
+                message_id: 150,
+                channel_id: 10,
+                author_id: 1,
+                author_name: "bot".into(),
+                content: "前回の回答".into(),
+                is_bot: true,
+                created_at: "2026-08-08T23:59:00Z".into(),
+            }),
+            linked_messages: vec![ReferencedMessage {
+                message_id: 999,
+                channel_id: 11,
+                author_id: 30,
+                author_name: "other_user".into(),
+                content: "過去の参考議論".into(),
+                is_bot: false,
+                created_at: "2026-08-07T12:00:00Z".into(),
+            }],
+            attachments: vec![],
+        }];
+
+        let serialized = serialize_safe_context(&context);
+        assert!(serialized.contains(r#""reply_to":{"message_id":150"#));
+        assert!(serialized.contains(r#""linked_messages":[{"message_id":999"#));
+        assert!(serialized.contains(r#""message_id":200"#));
     }
 }

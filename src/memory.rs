@@ -100,12 +100,15 @@ mod tests {
             memory(3, MemoryKind::Feedback, "回答方針", "結論を先にする"),
         ];
         let context = vec![ContextMessage {
+            message_id: 10,
             channel_id: 1,
             author_id: 2,
             author_name: "user".into(),
             content: "RustのResultについて".into(),
             is_bot: false,
             created_at: "2026-08-09".into(),
+            reply_to: None,
+            linked_messages: vec![],
             attachments: vec![ContextAttachment {
                 filename: "none".into(),
                 content_type: None,

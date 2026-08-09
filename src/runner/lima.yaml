@@ -9,8 +9,8 @@ base:
 vmType: qemu
 
 cpus: 2
-memory: 2GiB
-disk: 20GiB
+memory: 4GiB
+disk: 40GiB
 plain: true
 mounts: []
 portForwards: []
@@ -29,12 +29,48 @@ provision:
         build-essential \
         ca-certificates \
         cargo \
+        cabal-install \
+        coq \
         curl \
         git \
+        ghc \
+        libgmp-dev \
+        ocaml \
+        opam \
         pkg-config \
         python3 \
         python3-pip \
         python3-venv \
-        rustc
+        rustc \
+        sbcl
       apt-get clean
       rm -rf /var/lib/apt/lists/*
+
+      # Elm 0.19.1 — pre-compiled static binary, no Node.js required
+      ELM_VERSION="0.19.1"
+      curl -fsSL -o /tmp/elm.gz \
+        "https://github.com/elm/compiler/releases/download/${ELM_VERSION}/binary-for-linux-64-bit.gz"
+      gunzip /tmp/elm.gz
+      chmod +x /tmp/elm
+      mv /tmp/elm /usr/local/bin/elm
+
+      # Lazy-K interpreter (irori/lazyk) — build from source
+      LAZYK_COMMIT="7a13dcd"
+      LAZYK_DIR="/tmp/lazyk-build"
+      git clone https://github.com/irori/lazyk "$LAZYK_DIR"
+      git -C "$LAZYK_DIR" checkout "$LAZYK_COMMIT"
+      make -C "$LAZYK_DIR"
+      cp "$LAZYK_DIR/lazyk" /usr/local/bin/lazyk
+      rm -rf "$LAZYK_DIR"
+
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      # Lean 4 via elan — downloads ~180 MiB toolchain on first use.
+      # Install elan and pre-fetch the stable toolchain so sandbox runs are offline.
+      curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+        | sh -s -- -y --default-toolchain leanprover/lean4:stable
+      # Verify
+      source "$HOME/.elan/env"
+      lean --version

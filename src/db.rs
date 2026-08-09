@@ -191,8 +191,8 @@ impl Database {
             r#"
             INSERT INTO messages (
                 discord_message_id, guild_id, channel_id, settings_channel_id,
-                author_id, author_name, content, is_bot, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                author_id, author_name, content, is_bot, created_at, referenced_message_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (discord_message_id) DO NOTHING
             "#,
         )
@@ -205,6 +205,7 @@ impl Database {
         .bind(&message.content)
         .bind(message.is_bot)
         .bind(&message.created_at)
+        .bind(message.referenced_message_id.map(|id| id.to_string()))
         .execute(&mut *transaction)
         .await
         .context("failed to store message")?;
@@ -329,6 +330,37 @@ impl Database {
         Ok(deleted)
     }
 
+    pub async fn get_message_by_discord_id(
+        &self,
+        discord_message_id: u64,
+    ) -> Result<Option<crate::model::ReferencedMessage>> {
+        let row = sqlx::query(
+            r#"
+            SELECT discord_message_id, channel_id, author_id, author_name, content, is_bot, created_at
+            FROM messages
+            WHERE discord_message_id = ?
+            "#,
+        )
+        .bind(discord_message_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch message by discord id")?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        Ok(Some(crate::model::ReferencedMessage {
+            message_id: parse_id(row.try_get("discord_message_id")?)?,
+            channel_id: parse_id(row.try_get("channel_id")?)?,
+            author_id: parse_id(row.try_get("author_id")?)?,
+            author_name: row.try_get("author_name")?,
+            content: row.try_get("content")?,
+            is_bot: row.try_get("is_bot")?,
+            created_at: row.try_get("created_at")?,
+        }))
+    }
+
     pub async fn recent_channel_context(
         &self,
         guild_id: u64,
@@ -338,15 +370,24 @@ impl Database {
         let limit = limit.clamp(1, MAX_CONTEXT_MESSAGES);
         let rows = sqlx::query(
             r#"
-            SELECT m.id, m.channel_id, m.author_id, m.author_name,
-                   m.content, m.is_bot, m.created_at
+            SELECT m.id, m.discord_message_id, m.channel_id, m.author_id, m.author_name,
+                   m.content, m.is_bot, m.created_at, m.referenced_message_id,
+                   ref.discord_message_id AS ref_discord_message_id,
+                   ref.channel_id AS ref_channel_id,
+                   ref.author_id AS ref_author_id,
+                   ref.author_name AS ref_author_name,
+                   ref.content AS ref_content,
+                   ref.is_bot AS ref_is_bot,
+                   ref.created_at AS ref_created_at
             FROM messages AS m
             INNER JOIN channel_settings AS c
                 ON c.guild_id = m.guild_id
                AND c.channel_id = COALESCE(m.settings_channel_id, m.channel_id)
                AND c.mode != 'off'
+            LEFT JOIN messages AS ref
+                ON ref.discord_message_id = m.referenced_message_id
             WHERE m.guild_id = ? AND m.channel_id = ?
-            ORDER BY id DESC
+            ORDER BY m.id DESC
             LIMIT ?
             "#,
         )
@@ -367,13 +408,40 @@ impl Database {
             .fetch_all(&self.pool)
             .await?;
 
+            let reply_to = if let Some(ref_id_str) =
+                row.try_get::<Option<String>, _>("ref_discord_message_id")?
+            {
+                Some(crate::model::ReferencedMessage {
+                    message_id: parse_id(ref_id_str)?,
+                    channel_id: parse_id(
+                        row.try_get::<String, _>("ref_channel_id")
+                            .unwrap_or_default(),
+                    )
+                    .unwrap_or(0),
+                    author_id: parse_id(
+                        row.try_get::<String, _>("ref_author_id")
+                            .unwrap_or_default(),
+                    )
+                    .unwrap_or(0),
+                    author_name: row.try_get("ref_author_name").unwrap_or_default(),
+                    content: row.try_get("ref_content").unwrap_or_default(),
+                    is_bot: row.try_get("ref_is_bot").unwrap_or(false),
+                    created_at: row.try_get("ref_created_at").unwrap_or_default(),
+                })
+            } else {
+                None
+            };
+
             messages.push(ContextMessage {
+                message_id: parse_id(row.try_get("discord_message_id")?)?,
                 channel_id: parse_id(row.try_get("channel_id")?)?,
                 author_id: parse_id(row.try_get("author_id")?)?,
                 author_name: row.try_get("author_name")?,
                 content: row.try_get("content")?,
                 is_bot: row.try_get("is_bot")?,
                 created_at: row.try_get("created_at")?,
+                reply_to,
+                linked_messages: vec![],
                 attachments: attachment_rows
                     .into_iter()
                     .map(|attachment| ContextAttachment {
@@ -435,6 +503,27 @@ impl Database {
                 })
             })
             .collect()
+    }
+
+    /// Finds a channel ID by name within a guild (case-insensitive, returns first match).
+    pub async fn find_channel_id_by_name(
+        &self,
+        guild_id: u64,
+        channel_name: &str,
+    ) -> Result<Option<u64>> {
+        let row = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT channel_id FROM guild_channels
+            WHERE guild_id = ? AND LOWER(channel_name) = LOWER(?)
+            LIMIT 1
+            "#,
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_name)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to find channel by name")?;
+        row.map(parse_id).transpose()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -811,6 +900,8 @@ mod tests {
                     content: content.into(),
                     is_bot: false,
                     created_at: created_at.into(),
+                    referenced_message_id: None,
+                    referenced_message: None,
                     attachments: if message_id == 10 {
                         vec![IncomingAttachment {
                             filename: "main.rs".into(),
@@ -875,6 +966,8 @@ mod tests {
                 content: "old typo".into(),
                 is_bot: false,
                 created_at: "2026-08-09T00:00:00Z".into(),
+                referenced_message_id: None,
+                referenced_message: None,
                 attachments: vec![],
             })
             .await

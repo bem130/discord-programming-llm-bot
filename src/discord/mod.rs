@@ -234,6 +234,38 @@ impl DiscordBot {
             return Ok(());
         }
 
+        let (referenced_message_id, referenced_message) =
+            if let Some(ref_msg) = &message.referenced_message {
+                (
+                    Some(ref_msg.id.get()),
+                    Some(crate::model::ReferencedMessage {
+                        message_id: ref_msg.id.get(),
+                        channel_id: ref_msg.channel_id.get(),
+                        author_id: ref_msg.author.id.get(),
+                        author_name: ref_msg
+                            .author
+                            .global_name
+                            .clone()
+                            .unwrap_or_else(|| ref_msg.author.name.clone()),
+                        content: ref_msg.content.clone(),
+                        is_bot: ref_msg.author.bot,
+                        created_at: ref_msg.timestamp.to_string(),
+                    }),
+                )
+            } else if let Some(msg_ref) = &message.message_reference {
+                if let Some(msg_id) = msg_ref.message_id {
+                    let chan_id = msg_ref.channel_id.get();
+                    let ref_msg =
+                        resolve_referenced_message(context, &self.database, chan_id, msg_id.get())
+                            .await;
+                    (Some(msg_id.get()), Some(ref_msg))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
         let channel_name = match message.channel_id.to_channel(&context.http).await {
             Ok(Channel::Guild(channel)) => Some(channel.name),
             _ => None,
@@ -251,12 +283,14 @@ impl DiscordBot {
                 content: message.content.clone(),
                 is_bot: false,
                 created_at: message.timestamp.to_string(),
+                referenced_message_id,
+                referenced_message: referenced_message.clone(),
                 attachments,
             })
             .await?;
 
         let _response_guard = self.response_lock.lock().await;
-        let current_channel_context = self
+        let mut current_channel_context = self
             .database
             .recent_channel_context(
                 self.guild_id.get(),
@@ -264,6 +298,27 @@ impl DiscordBot {
                 RECENT_CONTEXT_MESSAGE_LIMIT,
             )
             .await?;
+
+        for ctx_msg in &mut current_channel_context {
+            let linked_urls = extract_discord_message_urls(&ctx_msg.content);
+            for (linked_chan_id, linked_msg_id) in linked_urls {
+                if ctx_msg.message_id != linked_msg_id
+                    && !ctx_msg
+                        .linked_messages
+                        .iter()
+                        .any(|m| m.message_id == linked_msg_id)
+                {
+                    let resolved = resolve_referenced_message(
+                        context,
+                        &self.database,
+                        linked_chan_id,
+                        linked_msg_id,
+                    )
+                    .await;
+                    ctx_msg.linked_messages.push(resolved);
+                }
+            }
+        }
         let recent_active_channels = self
             .database
             .recent_active_channels(
@@ -446,9 +501,11 @@ impl DiscordBot {
         }
 
         for (index, chunk) in chunks.into_iter().enumerate() {
-            let mut builder = CreateMessage::new()
-                .content(chunk)
-                .allowed_mentions(CreateAllowedMentions::new().replied_user(false));
+            let mut builder = CreateMessage::new().content(chunk).allowed_mentions(
+                CreateAllowedMentions::new()
+                    .all_users(true)
+                    .replied_user(true),
+            );
             if index == 0 {
                 builder = builder.reference_message(source_message);
             }
@@ -469,6 +526,20 @@ impl DiscordBot {
                     content: sent.content,
                     is_bot: true,
                     created_at: sent.timestamp.to_string(),
+                    referenced_message_id: (index == 0).then_some(source_message.id.get()),
+                    referenced_message: (index == 0).then(|| crate::model::ReferencedMessage {
+                        message_id: source_message.id.get(),
+                        channel_id: source_message.channel_id.get(),
+                        author_id: source_message.author.id.get(),
+                        author_name: source_message
+                            .author
+                            .global_name
+                            .clone()
+                            .unwrap_or_else(|| source_message.author.name.clone()),
+                        content: source_message.content.clone(),
+                        is_bot: source_message.author.bot,
+                        created_at: source_message.timestamp.to_string(),
+                    }),
                     attachments: vec![],
                 })
                 .await?;
@@ -670,6 +741,65 @@ fn is_text_attachment(attachment: &Attachment) -> bool {
             })
 }
 
+fn extract_discord_message_urls(content: &str) -> Vec<(u64, u64)> {
+    let mut results = Vec::new();
+    let re = match regex::Regex::new(
+        r"https://(?:ptb\.|canary\.)?discord\.com/channels/(?:@me|\d+)/(\d+)/(\d+)",
+    ) {
+        Ok(re) => re,
+        Err(_) => return results,
+    };
+    for captures in re.captures_iter(content) {
+        if let (Some(channel_mat), Some(message_mat)) = (captures.get(1), captures.get(2))
+            && let (Ok(channel_id), Ok(message_id)) = (
+                channel_mat.as_str().parse::<u64>(),
+                message_mat.as_str().parse::<u64>(),
+            )
+            && !results.contains(&(channel_id, message_id))
+        {
+            results.push((channel_id, message_id));
+        }
+    }
+    results.truncate(5);
+    results
+}
+
+async fn resolve_referenced_message(
+    context: &Context,
+    database: &Database,
+    channel_id: u64,
+    message_id: u64,
+) -> crate::model::ReferencedMessage {
+    if let Ok(Some(cached)) = database.get_message_by_discord_id(message_id).await {
+        return cached;
+    }
+
+    match context
+        .http
+        .get_message(ChannelId::new(channel_id), MessageId::new(message_id))
+        .await
+    {
+        Ok(disc_msg) => crate::model::ReferencedMessage {
+            message_id: disc_msg.id.get(),
+            channel_id: disc_msg.channel_id.get(),
+            author_id: disc_msg.author.id.get(),
+            author_name: disc_msg.author.global_name.unwrap_or(disc_msg.author.name),
+            content: disc_msg.content,
+            is_bot: disc_msg.author.bot,
+            created_at: disc_msg.timestamp.to_string(),
+        },
+        Err(_) => crate::model::ReferencedMessage {
+            message_id,
+            channel_id,
+            author_id: 0,
+            author_name: "Unknown".to_owned(),
+            content: "[メッセージを取得できませんでした]".to_owned(),
+            is_bot: false,
+            created_at: String::new(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,5 +841,12 @@ mod tests {
             inherited_settings_channel_id(thread_id, Some(parent_id), ChannelType::Text),
             thread_id
         );
+    }
+
+    #[test]
+    fn extracts_discord_message_urls() {
+        let content = "これを見て: https://discord.com/channels/12345/67890/999888777 あとこれも https://ptb.discord.com/channels/@me/111/222";
+        let extracted = extract_discord_message_urls(content);
+        assert_eq!(extracted, vec![(67890, 999888777), (111, 222)]);
     }
 }
