@@ -95,7 +95,7 @@ async fn semantic_review(
         model,
         ModelRequest::json(
             messages,
-            500,
+            1_200,
             "response_review",
             json!({
                 "type": "object",
@@ -106,7 +106,8 @@ async fn semantic_review(
                 "required": ["approved", "feedback"],
                 "additionalProperties": false
             }),
-        ),
+        )
+        .with_reasoning_effort("none"),
         "semantic_review",
     )
     .await

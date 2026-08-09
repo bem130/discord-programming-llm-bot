@@ -194,6 +194,8 @@ Discordで本文や添付が編集されると保存内容を置換し、本文�
   -> Rust側で分割してDiscordへ送信
 ```
 
+意味レビューとメモリ審査は最大3回再試行します。これらは短いstructured JSONを返す判定処理なので、Lunaのreasoningを `none` に固定し、通常回答生成のreasoning設定とは分離しています。空応答時のログには使用modelと `finish_reason` を記録します。未レビュー回答や仮メッセージを先に送ることはなく、処理中は8秒更新のtyping表示を使います。
+
 各promptには具体的な出力例を含めています。運営者方針は [owner_bem130_programming_stance.md](prompt/knowledge/owner_bem130_programming_stance.md) から独立したsystem knowledgeとして読み込みます。これはBotの安全規則やサーバー共通規約ではありません。
 
 ## Limaコード実行の安全境界

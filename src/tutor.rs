@@ -392,7 +392,7 @@ async fn review_memory_candidate(
                     serde_json::to_string(candidate)?
                 )),
             ],
-            400,
+            800,
             "memory_review",
             json!({
                 "type": "object",
@@ -403,7 +403,8 @@ async fn review_memory_candidate(
                 "required": ["approved", "reason"],
                 "additionalProperties": false
             }),
-        ),
+        )
+        .with_reasoning_effort("none"),
         "memory_review",
     )
     .await

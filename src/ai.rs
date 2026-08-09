@@ -116,6 +116,7 @@ pub struct ModelRequest {
     pub response_schema: Option<JsonResponseSchema>,
     pub web_search: bool,
     pub tools: Vec<Value>,
+    pub reasoning: Option<Value>,
 }
 
 impl ModelRequest {
@@ -126,6 +127,7 @@ impl ModelRequest {
             response_schema: None,
             web_search: false,
             tools: vec![],
+            reasoning: None,
         }
     }
 
@@ -136,6 +138,7 @@ impl ModelRequest {
             response_schema: None,
             web_search: true,
             tools: vec![],
+            reasoning: None,
         }
     }
 
@@ -154,11 +157,20 @@ impl ModelRequest {
             }),
             web_search: false,
             tools: vec![],
+            reasoning: None,
         }
     }
 
     pub fn with_tool(mut self, tool: Value) -> Self {
         self.tools.push(tool);
+        self
+    }
+
+    pub fn with_reasoning_effort(mut self, effort: &'static str) -> Self {
+        self.reasoning = Some(json!({
+            "effort": effort,
+            "exclude": true
+        }));
         self
     }
 }
@@ -236,7 +248,8 @@ impl LanguageModel for OpenRouterClient {
 
     async fn complete_response(&self, request: ModelRequest) -> Result<ModelResponse> {
         let heals_structured_response = request.response_schema.is_some();
-        let requires_parameter_support = heals_structured_response || !request.tools.is_empty();
+        let requires_parameter_support =
+            heals_structured_response || !request.tools.is_empty() || request.reasoning.is_some();
         let response_format = request.response_schema.map(|response_schema| {
             json!({
                 "type": "json_schema",
@@ -277,6 +290,7 @@ impl LanguageModel for OpenRouterClient {
                     "id": "response-healing"
                 })]
             }),
+            reasoning: request.reasoning,
             tools: (!tools.is_empty()).then_some(tools),
         };
 
@@ -308,12 +322,18 @@ impl LanguageModel for OpenRouterClient {
             used_model = completion.model.as_deref().unwrap_or("unknown"),
             "OpenRouter completion received"
         );
-        let message = completion
+        let used_model = completion.model.as_deref().unwrap_or("unknown").to_owned();
+        let choice = completion
             .choices
             .into_iter()
             .next()
-            .map(|choice| choice.message)
             .context("OpenRouter returned no choices")?;
+        let finish_reason = choice
+            .finish_reason
+            .as_deref()
+            .unwrap_or("unknown")
+            .to_owned();
+        let message = choice.message;
         let mut content = message.content;
         if request.web_search
             && let Some(content) = content.as_mut()
@@ -325,7 +345,9 @@ impl LanguageModel for OpenRouterClient {
             .is_none_or(|content| content.trim().is_empty())
             && message.tool_calls.is_empty()
         {
-            anyhow::bail!("OpenRouter returned no message content");
+            anyhow::bail!(
+                "OpenRouter returned no message content (model={used_model}, finish_reason={finish_reason})"
+            );
         }
         Ok(ModelResponse {
             content,
@@ -524,6 +546,8 @@ struct ChatCompletionRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     plugins: Option<Vec<Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<Value>>,
 }
 
@@ -537,6 +561,8 @@ struct ChatCompletionResponse {
 #[derive(Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -616,6 +642,17 @@ mod tests {
                 vec![]
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_can_be_disabled_for_short_structured_reviews() {
+        let request = ModelRequest::json(vec![], 1_200, "review", json!({ "type": "object" }))
+            .with_reasoning_effort("none");
+
+        assert_eq!(
+            request.reasoning,
+            Some(json!({ "effort": "none", "exclude": true }))
         );
     }
 
