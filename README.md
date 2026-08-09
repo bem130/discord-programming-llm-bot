@@ -43,9 +43,9 @@ data/                        既定のSQLite保存先
 - Rust stable toolchain
 - Discord ApplicationとBot token
 - OpenRouter API key
-- コード実行を有効にする場合はLima 2.xと、そのhostで利用できるvirtualization backend
+- コード実行を有効にする場合はLima 2.xとQEMU 11.0以降
 
-Limaの主要な対応hostはmacOSとLinuxです。Windows hostも記載されていますが未検証扱いで、WSL2 backendも実験的です。まずBot本体を `CODE_RUNNER_ENABLED=false` で起動し、Limaは対応host上で個別に検証することを推奨します。
+Lima公式ではWindows hostが未検証扱いで、WSL2 backendも実験的です。このプロジェクトのtemplateは通常のUbuntu disk imageと `apt` を使うため、host間で挙動が変わらないよう `vmType: qemu` を明示しています。
 
 ## Discord Developer Portal
 
@@ -94,6 +94,50 @@ CODE_EXECUTION_TIMEOUT_SECS=20
 ```
 
 `DISCORD_TOKEN`、`DISCORD_GUILD_ID`、`OPENROUTER_API_KEY`、`DATABASE_URL` は必須です。SQLite migrationは起動時に自動適用されます。PostgreSQLは使用しません。
+
+## Lima VMのセットアップ
+
+Windowsでは、リポジトリ直下から次のscriptを実行します。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/setup-lima-windows.ps1
+```
+
+このscriptは次を行います。
+
+- QEMU 11.0以降がなければ公式winget packageを導入またはupgrade
+- Lima 2.2.0の公式Windows archiveをdownloadし、releaseのSHA-256 digestを検証
+- Limaをユーザー領域へ展開し、Limaと必要なGit Unix toolsをユーザーの `PATH` へ追加
+- `src/runner/lima.yaml` を検証して `discord-code-runner` instanceを作成・起動
+- guest内のRust、Cargo、GCC、Pythonをsmoke test
+
+再実行しても、同じversionのLimaと既存instanceは再利用します。完了後は新しいPowerShellを開き、状態を確認できます。
+
+```powershell
+limactl --version
+limactl list
+limactl shell discord-code-runner bash -lc "rustc --version && cargo --version"
+```
+
+VMの作成・起動を行わずhost toolだけ導入する場合は `-SkipVmStart` を指定します。instance名やtemplateを変える場合は、それぞれ `-InstanceName` と `-Template` を指定し、Bot側の `LIMA_INSTANCE` と `LIMA_TEMPLATE` に同じ値を設定してください。
+
+中断された初回作成などでinstanceが `Broken` になった場合、scriptは既存diskを勝手に削除せず停止します。そのinstanceを破棄してよいことを確認した場合だけ、次のように再作成します。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/setup-lima-windows.ps1 `
+  -RecreateBrokenInstance
+```
+
+macOSまたはLinuxでは[Lima公式のinstallation手順](https://lima-vm.io/docs/installation/)に従ってLimaとQEMUを導入した後、次を実行します。
+
+```bash
+limactl validate src/runner/lima.yaml
+limactl --tty=false start --name discord-code-runner src/runner/lima.yaml
+limactl --tty=false shell discord-code-runner bash -lc \
+  'rustc --version && cargo --version && gcc --version | head -n 1 && python3 --version'
+```
+
+VMのsmoke testが完了するまでは `CODE_RUNNER_ENABLED=false` のままにします。Botを有効化するときだけ `true` に変更してください。Botの起動時には既存instanceを再利用し、停止中なら起動します。
 
 `OPENROUTER_REPLY_DECISION_MODELS` はアプリケーションが左から順に試すmodel IDです。既定値は、無料かつstructured outputs対応の `google/gemma-4-26b-a4b-it:free`、`nvidia/nemotron-3-super-120b-a12b:free`、利用可能な無料modelを選ぶ `openrouter/free`、最後に通常回答と同じLunaです。HTTPエラーだけでなく、不正JSONや空応答でも次のmodelへ進みます。JSON要求にはOpenRouterのResponse Healingも使用します。`inclusionai/ling-3.0-tiny:free` は2026-08-09時点の公式model一覧ではstructured outputs非対応のため、既定の判定modelからは外しています。
 
@@ -200,7 +244,11 @@ Discordで本文や添付が編集されると保存内容を置換し、本文�
 
 ## Limaコード実行の安全境界
 
-`CODE_RUNNER_ENABLED=true` の場合、Botは固定名のLima instanceを起動し、必要ならtemplateから作成します。host directoryのmountとport forwardingは無効にし、実行ファイルは一時directoryへbase64転送します。ファイル数、合計size、command数、package名、実行時間、出力量をRust側で制限します。
+`CODE_RUNNER_ENABLED=true` の場合、Botは固定名のLima instanceを起動し、存在しない場合だけtemplateから作成します。既存instanceの起動失敗を新規作成へ誤分類しないため、壊れたinstanceは明示的に再作成するまでエラーにします。
+
+host directoryのmountとport forwardingは無効にし、実行ファイルは一時directoryへbase64転送します。ファイル数、合計size、command数、package名、実行時間、出力量をRust側で制限します。実行は1件ずつ直列化するため、同じinstanceで `apt` やVM resourceを競合させません。
+
+生成されたcommandはroot権限を持つLima userから直接実行しません。`nobody` userの一時systemd unitへ落とし、system filesystemとhomeをread-only/不可視にした上で、1.5 GiB memory、150% CPU、256 process/thread、実行時間、単一file sizeを制限します。unit全体をcontrol groupとして終了するため、background processも実行後に残しません。追加のUbuntu packageを導入する段階だけは、Rust側で検証したpackage名を使ってLima userが `apt-get` を実行します。
 
 ただし、これは完全な対敵sandboxではありません。
 

@@ -4,6 +4,10 @@ minimumLimaVersion: 2.0.0
 base:
   - template:_images/ubuntu
 
+# Keep the backend deterministic across hosts. In particular, WSL2 cannot consume the
+# regular Ubuntu disk image inherited above and remains experimental in Lima.
+vmType: qemu
+
 cpus: 2
 memory: 2GiB
 disk: 20GiB

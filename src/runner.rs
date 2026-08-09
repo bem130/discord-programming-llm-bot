@@ -1,10 +1,15 @@
-use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    path::Path,
+    process::{Output, Stdio},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
+use tokio::{io::AsyncWriteExt, process::Command, sync::Mutex, time::timeout};
 
 const MAX_FILES: usize = 12;
 const MAX_FILE_BYTES: usize = 256 * 1024;
@@ -12,7 +17,10 @@ const MAX_TOTAL_FILE_BYTES: usize = 1024 * 1024;
 const MAX_COMMANDS: usize = 8;
 const MAX_COMMAND_BYTES: usize = 4_096;
 const MAX_PACKAGES: usize = 24;
+const MAX_PACKAGE_BYTES: usize = 128;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+const GUEST_MEMORY_LIMIT_MIB: usize = 1_536;
+const GUEST_TASK_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExecutionPlan {
@@ -50,6 +58,7 @@ pub struct LimaRunner {
     instance: String,
     template: String,
     execution_timeout: Duration,
+    execution_lock: Mutex<()>,
 }
 
 impl LimaRunner {
@@ -65,16 +74,21 @@ impl LimaRunner {
             instance,
             template,
             execution_timeout,
+            execution_lock: Mutex::new(()),
         })
     }
 
     pub async fn ensure_ready(&self) -> Result<()> {
-        let existing = run_limactl(
-            ["--tty=false", "start", self.instance.as_str()],
-            Duration::from_secs(90),
-        )
-        .await;
-        if existing.is_ok() {
+        let instances = run_limactl(["--tty=false", "list", "--quiet"], Duration::from_secs(30))
+            .await
+            .context("failed to list Lima instances")?;
+        if instance_list_contains(&instances.stdout, &self.instance) {
+            run_limactl(
+                ["--tty=false", "start", self.instance.as_str()],
+                Duration::from_secs(180),
+            )
+            .await
+            .context("failed to start existing Lima instance")?;
             return Ok(());
         }
 
@@ -107,6 +121,9 @@ impl CodeRunner for LimaRunner {
         if !plan.execute {
             bail!("execution plan is marked as disabled");
         }
+        // apt and the VM-wide CPU/memory budget are shared. Running plans concurrently would
+        // break both the package-manager and resource-isolation contracts.
+        let _execution_guard = self.execution_lock.lock().await;
 
         let script = build_guest_script(&plan, self.execution_timeout)?;
         let mut child = Command::new("limactl")
@@ -154,7 +171,7 @@ impl CodeRunner for LimaRunner {
 async fn run_limactl<'a>(
     args: impl IntoIterator<Item = &'a str>,
     command_timeout: Duration,
-) -> Result<()> {
+) -> Result<Output> {
     let output = timeout(
         command_timeout,
         Command::new("limactl")
@@ -166,9 +183,16 @@ async fn run_limactl<'a>(
     .context("limactl timed out")?
     .context("failed to launch limactl")?;
     if !output.status.success() {
-        bail!("limactl exited unsuccessfully");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("limactl exited unsuccessfully: {}", stderr.trim());
     }
-    Ok(())
+    Ok(output)
+}
+
+fn instance_list_contains(stdout: &[u8], instance: &str) -> bool {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .any(|line| line.trim() == instance)
 }
 
 fn validate_plan(plan: &ExecutionPlan) -> Result<()> {
@@ -201,6 +225,7 @@ fn validate_plan(plan: &ExecutionPlan) -> Result<()> {
     }
     for package in &plan.system_packages {
         if package.is_empty()
+            || package.len() > MAX_PACKAGE_BYTES
             || package.starts_with('-')
             || !package.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
@@ -235,7 +260,7 @@ fn validate_relative_path(path: &str) -> Result<()> {
 fn build_guest_script(plan: &ExecutionPlan, execution_timeout: Duration) -> Result<String> {
     validate_plan(plan)?;
     let mut script = String::from(
-        "#!/bin/bash\nset -euo pipefail\nworkdir=$(mktemp -d /tmp/discord-code-XXXXXX)\ntrap 'chmod -R u+w \"$workdir\" 2>/dev/null || true; rm -rf \"$workdir\"' EXIT\ncd \"$workdir\"\n",
+        "#!/bin/bash\nset -euo pipefail\nworkdir=$(sudo -n mktemp -d /opt/discord-code-XXXXXX)\ntrap 'sudo -n rm -rf \"$workdir\"' EXIT\nsudo -n chown \"$(id -u):$(id -g)\" \"$workdir\"\ncd \"$workdir\"\numask 077\n",
     );
     for file in &plan.files {
         if let Some(parent) = Path::new(&file.path).parent()
@@ -263,10 +288,19 @@ fn build_guest_script(plan: &ExecutionPlan, execution_timeout: Duration) -> Resu
         "printf '%s' '{}' | base64 --decode > .discord-run.sh\n",
         STANDARD.encode(command_script.as_bytes())
     ));
-    script.push_str(&format!(
-        "set +e\ntimeout --kill-after=2s {}s bash .discord-run.sh 2>&1 | head -c {}\nstatus=${{PIPESTATUS[0]}}\nexit \"$status\"\n",
+    let wrapper_script = format!(
+        "#!/bin/bash\nset +e\nulimit -f 524288\ntimeout --kill-after=2s {}s bash .discord-run.sh 2>&1 | head -c {}\nstatus=${{PIPESTATUS[0]}}\nexit \"$status\"\n",
         execution_timeout.as_secs(),
         MAX_OUTPUT_BYTES
+    );
+    script.push_str(&format!(
+        "printf '%s' '{}' | base64 --decode > .discord-wrapper.sh\n",
+        STANDARD.encode(wrapper_script.as_bytes())
+    ));
+    script.push_str("cd /\nsudo -n chown -R nobody:nogroup \"$workdir\"\nset +e\n");
+    script.push_str(&format!(
+        "sudo -n systemd-run --quiet --wait --pipe --collect \\\n+  --uid=nobody \\\n+  --working-directory=\"$workdir\" \\\n+  --setenv=\"HOME=$workdir\" \\\n+  --setenv='PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \\\n+  --setenv='LANG=C.UTF-8' \\\n+  --property=NoNewPrivileges=yes \\\n+  --property=MemoryMax={GUEST_MEMORY_LIMIT_MIB}M \\\n+  --property=MemorySwapMax=0 \\\n+  --property=CPUQuota=150% \\\n+  --property=TasksMax={GUEST_TASK_LIMIT} \\\n+  --property=KillMode=control-group \\\n+  --property=RuntimeMaxSec={}s \\\n+  --property=PrivateTmp=yes \\\n+  --property=PrivateDevices=yes \\\n+  --property=ProtectSystem=strict \\\n+  --property=ProtectHome=yes \\\n+  --property=\"ReadWritePaths=$workdir\" \\\n+  --property=ProtectKernelTunables=yes \\\n+  --property=ProtectKernelModules=yes \\\n+  --property=ProtectControlGroups=yes \\\n+  --property=ProtectHostname=yes \\\n+  --property=RestrictSUIDSGID=yes \\\n+  --property=RestrictRealtime=yes \\\n+  --property=LockPersonality=yes \\\n+  /bin/bash \"$workdir/.discord-wrapper.sh\"\nstatus=$?\nexit \"$status\"\n",
+        execution_timeout.as_secs().saturating_add(5)
     ));
     Ok(script)
 }
@@ -302,5 +336,23 @@ mod tests {
         assert!(!script.contains(&plan.files[0].content));
         assert!(!script.contains(&plan.commands[0]));
         assert!(script.contains("base64 --decode"));
+        assert!(script.contains("systemd-run"));
+        assert!(script.contains("--uid=nobody"));
+        assert!(script.contains("ProtectSystem=strict"));
+        assert!(script.contains("MemoryMax=1536M"));
+    }
+
+    #[test]
+    fn instance_names_are_matched_as_complete_lines() {
+        let output = b"other\ndiscord-code-runner\ndiscord-code-runner-2\n";
+        assert!(instance_list_contains(output, "discord-code-runner"));
+        assert!(!instance_list_contains(output, "discord"));
+    }
+
+    #[test]
+    fn rejects_unreasonably_long_package_names() {
+        let mut plan = valid_plan();
+        plan.system_packages = vec!["a".repeat(MAX_PACKAGE_BYTES + 1)];
+        assert!(validate_plan(&plan).is_err());
     }
 }
