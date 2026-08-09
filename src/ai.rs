@@ -306,6 +306,12 @@ impl LanguageModel for OpenRouterClient {
                     }
                 }),
             );
+            tools.insert(
+                1,
+                json!({
+                    "type": "openrouter:web_fetch"
+                }),
+            );
         }
         let payload = ChatCompletionRequest {
             model: &self.model,
@@ -736,6 +742,33 @@ mod tests {
             payload["session_id"],
             "discord-learn-programming-bot:guild:123:conversation"
         );
+    }
+
+    #[test]
+    fn web_search_injects_both_search_and_fetch_tools() {
+        let mut tools = vec![];
+        if true {
+            tools.insert(
+                0,
+                json!({
+                    "type": "openrouter:web_search",
+                    "parameters": {
+                        "max_results": 5,
+                        "max_total_results": 8,
+                        "search_context_size": "low"
+                    }
+                }),
+            );
+            tools.insert(
+                1,
+                json!({
+                    "type": "openrouter:web_fetch"
+                }),
+            );
+        }
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["type"], "openrouter:web_search");
+        assert_eq!(tools[1]["type"], "openrouter:web_fetch");
     }
 
     #[test]

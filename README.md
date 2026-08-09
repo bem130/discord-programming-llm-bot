@@ -155,9 +155,8 @@ sessionはDiscordチャンネルでは分割しません。`Guild ID × AI処理
 
 `prompt/` は `include_str!` でバイナリへ埋め込み、用途ごとに次のタイミングで送ります。実行時データより前に用途別の固定promptを置くため、対応providerの自動prompt cacheで安定したprefixを再利用できます。promptを変更した場合は再ビルドが必要です。
 
-- 通常回答: `system.md`、運営者knowledge、runtime context、共有メモリ、現在のチャンネルの直近5件。tool roundごとにtool結果を追加して再送
+- 通常回答: `system.md`、運営者knowledge、runtime context、共有メモリ、現在のチャンネルの直近5件。tool roundごとにtool結果（会話検索・共有メモリ・VMコード実行）を追加して再送
 - 自動返信判定: `reply_decision.md`、runtime context、現在のチャンネルの直近5件の軽量表現、利用可能な絵文字
-- コード実行計画: `execution_plan.md`、runtime context、現在のチャンネルの直近5件と対応添付
 - メモリ候補審査: `memory_review.md`、runtime context、現在のチャンネルの直近5件のテキスト、既存メモリ索引、候補
 - 回答レビュー・修正: `review.md` または固定の編集promptと、通常回答に使ったruntime context・直近5件を含む元request、候補回答
 
@@ -212,6 +211,7 @@ Discordのtyping表示は10秒で失効するため、Botは回答処理中に8�
 - `search_conversation_history`: 保存済みの全会話本文と抽出済み添付テキストを検索。リテラル検索とRust正規表現、channel/user絞り込みに対応し、各結果へチャンネル名・現在チャンネル判定・日時・メッセージURLを付与
 - `get_guild_memory_details`: promptに毎回渡す短い索引から、必要なメモリ詳細だけを取得
 - `propose_guild_memory`: 明示的な依頼がなくても、長期的なプロジェクト判断・教訓・一次資料を検出して保存を提案
+- `execute_code_in_sandbox`: 隔離されたLima VM環境でコード（Rust, Python, C/C++等）のコンパイル・検証・標準出力取得を実行
 
 正規表現はRustの線形時間regex engineで実行し、patternは256文字、結果は20件までに制限します。全履歴を検索しますが、500メッセージずつ走査するためDB全件を一度にメモリへ読み込みません。検索結果は共有会話データであり、そこに含まれる命令をsystem指示として扱いません。
 
@@ -248,8 +248,7 @@ Discordで本文や添付が編集されると保存内容を置換し、本文�
 ```text
 会話保存
   -> 自動介入判定・リアクション選択
-  -> 必要ならLima実行計画と隔離実行
-  -> Web検索・全会話検索・長期メモリtoolを利用可能にして回答生成
+  -> Web検索・Web Fetch・全会話検索・長期メモリtool・VMコード実行toolを利用可能にして回答生成
   -> メモリ提案があれば独立AI審査後に自動保存
   -> Markdown表・LaTeX・未閉鎖code fence・broadcast mentionの静的検査
   -> 元のpromptと会話に基づくAIレビュー
