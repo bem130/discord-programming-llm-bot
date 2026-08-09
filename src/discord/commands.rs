@@ -6,7 +6,11 @@ use serenity::all::{
     RoleId,
 };
 
-use crate::{db::Database, delivery::split_message, model::ChannelMode};
+use crate::{
+    db::Database,
+    delivery::split_message,
+    model::{ChannelMode, MemoryKind, MemoryStatus},
+};
 
 pub fn ai_command() -> CreateCommand {
     let channel = CreateCommandOption::new(
@@ -62,6 +66,52 @@ pub fn ai_command() -> CreateCommand {
         )
         .required(false),
     );
+    let memory_add = CreateCommandOption::new(
+        CommandOptionType::SubCommand,
+        "add",
+        "確認済みの重要情報をサーバー共有メモリへ追加します",
+    )
+    .add_sub_option(
+        CreateCommandOption::new(CommandOptionType::String, "kind", "メモリの種類")
+            .required(true)
+            .add_string_choice("運用フィードバック", "feedback")
+            .add_string_choice("プロジェクト情報・判断", "project")
+            .add_string_choice("参考資料", "reference"),
+    )
+    .add_sub_option(
+        CreateCommandOption::new(CommandOptionType::String, "title", "短い識別名").required(true),
+    )
+    .add_sub_option(
+        CreateCommandOption::new(CommandOptionType::String, "summary", "毎回参照する短い要約")
+            .required(true),
+    )
+    .add_sub_option(
+        CreateCommandOption::new(
+            CommandOptionType::String,
+            "content",
+            "必要時に参照する詳細と判断理由",
+        )
+        .required(true),
+    );
+    let memory_list = CreateCommandOption::new(
+        CommandOptionType::SubCommand,
+        "list",
+        "メモリ候補・有効メモリ・期限切れを一覧表示します",
+    );
+    let memory_approve = memory_id_subcommand("approve", "AIが提案したメモリ候補を承認します");
+    let memory_review =
+        memory_id_subcommand("review", "内容を確認したメモリの期限を30日延長します");
+    let memory_remove = memory_id_subcommand("remove", "メモリまたは候補を無効化します");
+    let memory = CreateCommandOption::new(
+        CommandOptionType::SubCommandGroup,
+        "memory",
+        "サーバー共有の長期メモリを管理します",
+    )
+    .add_sub_option(memory_add)
+    .add_sub_option(memory_list)
+    .add_sub_option(memory_approve)
+    .add_sub_option(memory_review)
+    .add_sub_option(memory_remove);
 
     CreateCommand::new("ai")
         .description("プログラミング講師AIの設定を管理します")
@@ -69,7 +119,14 @@ pub fn ai_command() -> CreateCommand {
         .dm_permission(false)
         .add_option(channel)
         .add_option(role)
+        .add_option(memory)
         .add_option(status)
+}
+
+fn memory_id_subcommand(name: &'static str, description: &'static str) -> CreateCommandOption {
+    CreateCommandOption::new(CommandOptionType::SubCommand, name, description).add_sub_option(
+        CreateCommandOption::new(CommandOptionType::Integer, "id", "対象メモリID").required(true),
+    )
 }
 
 pub async fn handle_ai_command(
@@ -106,11 +163,144 @@ pub async fn handle_ai_command(
             configure_invocation_role(context, command, configured_guild_id, database, options)
                 .await
         }
+        ("memory", CommandDataOptionValue::SubCommandGroup(options)) => {
+            handle_memory(context, command, configured_guild_id, database, options).await
+        }
         ("status", CommandDataOptionValue::SubCommand(options)) => {
             show_status(context, command, configured_guild_id, database, options).await
         }
         _ => bail!("unknown /ai subcommand"),
     }
+}
+
+async fn handle_memory(
+    context: &Context,
+    command: &CommandInteraction,
+    guild_id: GuildId,
+    database: &Database,
+    options: &[CommandDataOption],
+) -> Result<()> {
+    let action = options.first().context("missing memory action")?;
+    let CommandDataOptionValue::SubCommand(arguments) = &action.value else {
+        bail!("invalid memory action");
+    };
+    match action.name.as_str() {
+        "add" => {
+            let kind = string_option(arguments, "kind")
+                .context("missing memory kind")?
+                .parse::<MemoryKind>()?;
+            let title = string_option(arguments, "title").context("missing memory title")?;
+            let summary = string_option(arguments, "summary").context("missing memory summary")?;
+            let content = string_option(arguments, "content").context("missing memory content")?;
+            if let Some(problem) = validate_memory_text(title, summary, content) {
+                return respond_public(context, command, problem).await;
+            }
+            let id = database
+                .create_memory(
+                    guild_id.get(),
+                    kind,
+                    title,
+                    summary,
+                    content,
+                    MemoryStatus::Active,
+                    command.user.id.get(),
+                    Some(command.channel_id.get()),
+                    None,
+                )
+                .await?;
+            respond_public(
+                context,
+                command,
+                &format!(
+                    "メモリ `#{id}`（`{kind}`）を追加しました。30日以内に `/ai memory review` で再確認してください。"
+                ),
+            )
+            .await
+        }
+        "list" => {
+            let memories = database.list_memories(guild_id.get()).await?;
+            let mut lines =
+                vec!["サーバー共有メモリ（候補は承認されるまでAI回答に使われません）:".to_owned()];
+            if memories.is_empty() {
+                lines.push("- なし".to_owned());
+            } else {
+                lines.extend(memories.into_iter().map(|memory| {
+                    let state = if memory.stale {
+                        "stale"
+                    } else {
+                        memory.status.as_str()
+                    };
+                    format!(
+                        "- `#{}` [`{}` / `{state}`] {} — {}",
+                        memory.id, memory.kind, memory.title, memory.summary
+                    )
+                }));
+            }
+            respond_public(context, command, &lines.join("\n")).await
+        }
+        "approve" => {
+            let id = memory_id(arguments)?;
+            let changed = database.approve_memory(guild_id.get(), id).await?;
+            respond_public(
+                context,
+                command,
+                if changed {
+                    "候補を承認し、有効な共有メモリにしました。"
+                } else {
+                    "承認可能な候補が見つかりません。IDと状態を確認してください。"
+                },
+            )
+            .await
+        }
+        "review" => {
+            let id = memory_id(arguments)?;
+            let changed = database.review_memory(guild_id.get(), id).await?;
+            respond_public(
+                context,
+                command,
+                if changed {
+                    "内容を再確認済みにし、参照期限を30日延長しました。"
+                } else {
+                    "有効なメモリが見つかりません。IDと状態を確認してください。"
+                },
+            )
+            .await
+        }
+        "remove" => {
+            let id = memory_id(arguments)?;
+            let changed = database.remove_memory(guild_id.get(), id).await?;
+            respond_public(
+                context,
+                command,
+                if changed {
+                    "メモリを無効化しました。以後AI回答には使われません。"
+                } else {
+                    "対象メモリが見つかりません。"
+                },
+            )
+            .await
+        }
+        _ => bail!("unknown memory action"),
+    }
+}
+
+fn validate_memory_text(title: &str, summary: &str, content: &str) -> Option<&'static str> {
+    if title.trim().is_empty() || summary.trim().is_empty() || content.trim().is_empty() {
+        return Some("title、summary、contentには空でない文字列を指定してください。");
+    }
+    if title.chars().count() > 100
+        || summary.chars().count() > 300
+        || content.chars().count() > 3_000
+    {
+        return Some("長さの上限はtitle 100文字、summary 300文字、content 3000文字です。");
+    }
+    None
+}
+
+fn memory_id(options: &[CommandDataOption]) -> Result<i64> {
+    let id = integer_option(options, "id").context("missing memory id")?;
+    anyhow::ensure!(id > 0, "memory id must be positive");
+    Ok(id)
 }
 
 async fn configure_invocation_role(
@@ -308,6 +498,17 @@ fn role_option(options: &[CommandDataOption], name: &str) -> Option<RoleId> {
             .then_some(&option.value)
             .and_then(|value| match value {
                 CommandDataOptionValue::Role(role_id) => Some(*role_id),
+                _ => None,
+            })
+    })
+}
+
+fn integer_option(options: &[CommandDataOption], name: &str) -> Option<i64> {
+    options.iter().find_map(|option| {
+        (option.name == name)
+            .then_some(&option.value)
+            .and_then(|value| match value {
+                CommandDataOptionValue::Integer(value) => Some(*value),
                 _ => None,
             })
     })

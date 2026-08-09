@@ -6,18 +6,22 @@ use std::{
         RwLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result};
 use serenity::{
     all::{
         Attachment, Channel, ChannelId, ChannelType, Context, CreateAllowedMentions, CreateMessage,
-        Emoji, EventHandler, GatewayIntents, GuildId, Interaction, Message, ReactionType, Ready,
-        RoleId,
+        Emoji, EventHandler, GatewayIntents, GuildId, Interaction, Message, MessageId,
+        MessageUpdateEvent, ReactionType, Ready, RoleId,
     },
     async_trait,
 };
-use tokio::sync::Mutex;
+use tokio::{
+    sync::{Mutex, oneshot},
+    task::JoinHandle,
+};
 
 use crate::{
     ai::SharedLanguageModel,
@@ -32,11 +36,14 @@ use crate::{
 const CONTEXT_MESSAGE_LIMIT: u32 = 40;
 const MAX_TEXT_ATTACHMENT_BYTES: u32 = 512 * 1024;
 const MAX_MULTIMODAL_ATTACHMENT_BYTES: u32 = 20 * 1024 * 1024;
+const TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
 
 pub struct DiscordBot {
     guild_id: GuildId,
     database: Database,
     model: SharedLanguageModel,
+    decision_models: Vec<SharedLanguageModel>,
+    intervention_threshold: f64,
     bot_user_id: AtomicU64,
     bot_owner_id: AtomicU64,
     bot_name: RwLock<String>,
@@ -50,12 +57,16 @@ impl DiscordBot {
         guild_id: GuildId,
         database: Database,
         model: SharedLanguageModel,
+        decision_models: Vec<SharedLanguageModel>,
+        intervention_threshold: f64,
         runner: Option<SharedCodeRunner>,
     ) -> Self {
         Self {
             guild_id,
             database,
             model,
+            decision_models,
+            intervention_threshold,
             bot_user_id: AtomicU64::new(0),
             bot_owner_id: AtomicU64::new(0),
             bot_name: RwLock::new(String::new()),
@@ -136,6 +147,76 @@ impl EventHandler for DiscordBot {
             );
         }
     }
+
+    async fn message_update(
+        &self,
+        _context: Context,
+        _old_if_available: Option<Message>,
+        _new: Option<Message>,
+        event: MessageUpdateEvent,
+    ) {
+        if event.guild_id.is_some() && event.guild_id != Some(self.guild_id) {
+            return;
+        }
+        let attachments = match event.attachments.as_deref() {
+            Some(attachments) => Some(extract_attachments(attachments).await),
+            None => None,
+        };
+        let edited_at = event
+            .edited_timestamp
+            .map(|timestamp| timestamp.to_string());
+        if let Err(error) = self
+            .database
+            .update_message(
+                event.id.get(),
+                event.content.as_deref(),
+                attachments.as_deref(),
+                edited_at.as_deref(),
+            )
+            .await
+        {
+            tracing::error!(
+                ?error,
+                message_id = event.id.get(),
+                "failed to sync message edit"
+            );
+        }
+    }
+
+    async fn message_delete(
+        &self,
+        _context: Context,
+        _channel_id: ChannelId,
+        deleted_message_id: MessageId,
+        guild_id: Option<GuildId>,
+    ) {
+        if guild_id.is_some() && guild_id != Some(self.guild_id) {
+            return;
+        }
+        if let Err(error) = self.database.delete_message(deleted_message_id.get()).await {
+            tracing::error!(
+                ?error,
+                message_id = deleted_message_id.get(),
+                "failed to sync message deletion"
+            );
+        }
+    }
+
+    async fn message_delete_bulk(
+        &self,
+        _context: Context,
+        _channel_id: ChannelId,
+        deleted_message_ids: Vec<MessageId>,
+        guild_id: Option<GuildId>,
+    ) {
+        if guild_id.is_some() && guild_id != Some(self.guild_id) {
+            return;
+        }
+        let ids: Vec<_> = deleted_message_ids.iter().map(|id| id.get()).collect();
+        if let Err(error) = self.database.delete_messages(&ids).await {
+            tracing::error!(?error, "failed to sync bulk message deletion");
+        }
+    }
 }
 
 impl DiscordBot {
@@ -157,6 +238,7 @@ impl DiscordBot {
                 discord_message_id: message.id.get(),
                 guild_id: self.guild_id.get(),
                 channel_id: message.channel_id.get(),
+                settings_channel_id: settings_channel_id.get(),
                 author_id: message.author.id.get(),
                 author_name: message.author.name.clone(),
                 content: message.content.clone(),
@@ -203,9 +285,10 @@ impl DiscordBot {
             .map(|emoji| emoji.name.clone())
             .collect();
         let action = decide_action(
-            self.model.as_ref(),
+            &self.decision_models,
             mode,
             forced_reply,
+            self.intervention_threshold,
             &guild_context,
             &emoji_names,
         )
@@ -223,7 +306,7 @@ impl DiscordBot {
             return Ok(());
         }
 
-        let _ = message.channel_id.broadcast_typing(&context.http).await;
+        let _typing = TypingGuard::start(context, message.channel_id);
         let response_mode = if direct {
             ResponseMode::Direct
         } else if mentioned {
@@ -234,14 +317,19 @@ impl DiscordBot {
         let runtime_context = self
             .runtime_context(context, message, response_mode, bot_user_id)
             .await;
+        let memories = self.database.active_memories(self.guild_id.get()).await?;
         let answer = generate_reviewed_answer(
             self.model.as_ref(),
             &guild_context,
             &runtime_context,
+            &memories,
+            &self.database,
+            message.id.get(),
             self.runner.as_deref(),
         )
         .await?;
-        self.send_answer(context, message, &answer).await
+        self.send_answer(context, message, settings_channel_id, &answer)
+            .await
     }
 
     async fn runtime_context(
@@ -319,6 +407,7 @@ impl DiscordBot {
         &self,
         context: &Context,
         source_message: &Message,
+        settings_channel_id: ChannelId,
         answer: &str,
     ) -> Result<()> {
         let chunks = split_message(answer);
@@ -343,6 +432,7 @@ impl DiscordBot {
                     discord_message_id: sent.id.get(),
                     guild_id: self.guild_id.get(),
                     channel_id: sent.channel_id.get(),
+                    settings_channel_id: settings_channel_id.get(),
                     author_id: sent.author.id.get(),
                     author_name: sent.author.name,
                     content: sent.content,
@@ -353,6 +443,44 @@ impl DiscordBot {
                 .await?;
         }
         Ok(())
+    }
+}
+
+struct TypingGuard {
+    stop: Option<oneshot::Sender<()>>,
+    _task: JoinHandle<()>,
+}
+
+impl TypingGuard {
+    fn start(context: &Context, channel_id: ChannelId) -> Self {
+        let http = context.http.clone();
+        let (stop, mut stopped) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(TYPING_REFRESH_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    _ = interval.tick() => {
+                        if let Err(error) = channel_id.broadcast_typing(&http).await {
+                            tracing::debug!(?error, "failed to refresh Discord typing indicator");
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            stop: Some(stop),
+            _task: task,
+        }
+    }
+}
+
+impl Drop for TypingGuard {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
     }
 }
 

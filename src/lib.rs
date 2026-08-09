@@ -4,6 +4,7 @@ pub mod context;
 pub mod db;
 pub mod delivery;
 pub mod discord;
+pub mod memory;
 pub mod model;
 pub mod review;
 pub mod runner;

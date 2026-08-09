@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::ai::{LanguageModel, ModelRequest, PromptMessage, complete_json};
+use crate::ai::{
+    LanguageModel, ModelRequest, PromptMessage, complete_json_with_retry, complete_with_retry,
+};
 
 const REVIEW_PROMPT: &str = include_str!("../prompt/review.md");
 const MAX_REPAIR_ATTEMPTS: usize = 2;
@@ -89,7 +91,7 @@ async fn semantic_review(
         "上記が元の会話です。候補回答を審査してください。\n<candidate>\n{candidate}\n</candidate>"
     )));
 
-    complete_json(
+    complete_json_with_retry(
         model,
         ModelRequest::json(
             messages,
@@ -105,6 +107,7 @@ async fn semantic_review(
                 "additionalProperties": false
             }),
         ),
+        "semantic_review",
     )
     .await
     .context("AI response review failed")
@@ -123,10 +126,13 @@ async fn repair(
     messages.push(PromptMessage::user(format!(
         "上記が元の会話です。\n\n候補回答:\n<candidate>\n{candidate}\n</candidate>\n\n修正指示:\n{feedback}"
     )));
-    model
-        .complete(ModelRequest::text(messages, 4_000))
-        .await
-        .context("AI response repair failed")
+    complete_with_retry(
+        model,
+        ModelRequest::text(messages, 4_000),
+        "response_repair",
+    )
+    .await
+    .context("AI response repair failed")
 }
 
 fn looks_like_table_separator(line: &str) -> bool {

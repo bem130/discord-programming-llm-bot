@@ -19,9 +19,21 @@ async fn main() -> anyhow::Result<()> {
     let database = Database::connect(&config.database_url).await?;
     let model: SharedLanguageModel = Arc::new(OpenRouterClient::new(
         &config.openrouter_base_url,
-        config.openrouter_api_key,
-        config.openrouter_model,
+        config.openrouter_api_key.clone(),
+        config.openrouter_model.clone(),
     )?);
+    let decision_models: Vec<SharedLanguageModel> = config
+        .reply_decision_models
+        .iter()
+        .map(|model| {
+            OpenRouterClient::new(
+                &config.openrouter_base_url,
+                config.openrouter_api_key.clone(),
+                model.clone(),
+            )
+            .map(|client| Arc::new(client) as SharedLanguageModel)
+        })
+        .collect::<anyhow::Result<_>>()?;
     let runner: Option<SharedCodeRunner> = if config.code_runner_enabled {
         let runner = Arc::new(LimaRunner::new(
             config.lima_instance,
@@ -37,6 +49,8 @@ async fn main() -> anyhow::Result<()> {
         GuildId::new(config.discord_guild_id.get()),
         database,
         model,
+        decision_models,
+        config.reply_decision_threshold,
         runner,
     );
     let mut client = Client::builder(config.discord_token, required_intents())
