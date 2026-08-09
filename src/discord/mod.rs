@@ -1,15 +1,19 @@
 mod commands;
 
-use std::sync::{
-    RwLock,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use anyhow::{Context as _, Result};
 use serenity::{
     all::{
-        Attachment, Channel, Context, CreateAllowedMentions, CreateMessage, Emoji, EventHandler,
-        GatewayIntents, GuildId, Interaction, Message, ReactionType, Ready,
+        Attachment, Channel, ChannelId, ChannelType, Context, CreateAllowedMentions, CreateMessage,
+        Emoji, EventHandler, GatewayIntents, GuildId, Interaction, Message, ReactionType, Ready,
+        RoleId,
     },
     async_trait,
 };
@@ -36,6 +40,7 @@ pub struct DiscordBot {
     bot_user_id: AtomicU64,
     bot_owner_id: AtomicU64,
     bot_name: RwLock<String>,
+    settings_channel_cache: RwLock<HashMap<u64, u64>>,
     response_lock: Mutex<()>,
     runner: Option<SharedCodeRunner>,
 }
@@ -54,6 +59,7 @@ impl DiscordBot {
             bot_user_id: AtomicU64::new(0),
             bot_owner_id: AtomicU64::new(0),
             bot_name: RwLock::new(String::new()),
+            settings_channel_cache: RwLock::new(HashMap::new()),
             response_lock: Mutex::new(()),
             runner,
         }
@@ -134,9 +140,12 @@ impl EventHandler for DiscordBot {
 
 impl DiscordBot {
     async fn handle_message(&self, context: &Context, message: &Message) -> Result<()> {
+        let settings_channel_id = self
+            .cached_configuration_channel_id(context, message.channel_id)
+            .await?;
         let mode = self
             .database
-            .channel_mode(self.guild_id.get(), message.channel_id.get())
+            .channel_mode(self.guild_id.get(), settings_channel_id.get())
             .await?;
         if !mode.stores_messages() {
             return Ok(());
@@ -163,11 +172,18 @@ impl DiscordBot {
             .recent_context(self.guild_id.get(), CONTEXT_MESSAGE_LIMIT)
             .await?;
         let bot_user_id = self.bot_user_id.load(Ordering::Relaxed);
-        let mentioned = bot_user_id != 0
+        let user_mentioned = bot_user_id != 0
             && message
                 .mentions
                 .iter()
                 .any(|user| user.id.get() == bot_user_id);
+        let invocation_role_id = self
+            .database
+            .invocation_role_id(self.guild_id.get())
+            .await?;
+        let role_mentioned =
+            is_invocation_role_mentioned(invocation_role_id, message.mention_roles.as_slice());
+        let mentioned = user_mentioned || role_mentioned;
         let direct = bot_user_id != 0
             && message
                 .referenced_message
@@ -278,6 +294,27 @@ impl DiscordBot {
         }
     }
 
+    async fn cached_configuration_channel_id(
+        &self,
+        context: &Context,
+        channel_id: ChannelId,
+    ) -> Result<ChannelId> {
+        if let Some(settings_channel_id) = self
+            .settings_channel_cache
+            .read()
+            .ok()
+            .and_then(|cache| cache.get(&channel_id.get()).copied())
+        {
+            return Ok(ChannelId::new(settings_channel_id));
+        }
+
+        let settings_channel_id = configuration_channel_id(context, channel_id).await?;
+        if let Ok(mut cache) = self.settings_channel_cache.write() {
+            cache.insert(channel_id.get(), settings_channel_id.get());
+        }
+        Ok(settings_channel_id)
+    }
+
     async fn send_answer(
         &self,
         context: &Context,
@@ -316,6 +353,39 @@ impl DiscordBot {
                 .await?;
         }
         Ok(())
+    }
+}
+
+pub(super) async fn configuration_channel_id(
+    context: &Context,
+    channel_id: ChannelId,
+) -> Result<ChannelId> {
+    let channel = channel_id
+        .to_channel(&context.http)
+        .await
+        .context("failed to resolve message channel")?;
+    let Channel::Guild(channel) = channel else {
+        return Ok(channel_id);
+    };
+    Ok(inherited_settings_channel_id(
+        channel.id,
+        channel.parent_id,
+        channel.kind,
+    ))
+}
+
+fn inherited_settings_channel_id(
+    channel_id: ChannelId,
+    parent_id: Option<ChannelId>,
+    channel_type: ChannelType,
+) -> ChannelId {
+    if matches!(
+        channel_type,
+        ChannelType::NewsThread | ChannelType::PublicThread | ChannelType::PrivateThread
+    ) {
+        parent_id.unwrap_or(channel_id)
+    } else {
+        channel_id
     }
 }
 
@@ -390,6 +460,17 @@ fn resolve_reaction(requested: &str, custom_emojis: &[Emoji]) -> Option<Reaction
         .then(|| ReactionType::Unicode(requested.to_owned()))
 }
 
+fn is_invocation_role_mentioned(
+    configured_role_id: Option<u64>,
+    mentioned_roles: &[RoleId],
+) -> bool {
+    configured_role_id.is_some_and(|configured_role_id| {
+        mentioned_roles
+            .iter()
+            .any(|role_id| role_id.get() == configured_role_id)
+    })
+}
+
 fn is_text_attachment(attachment: &Attachment) -> bool {
     attachment
         .content_type
@@ -445,5 +526,31 @@ mod tests {
     #[test]
     fn rejects_unknown_shortcode() {
         assert!(resolve_reaction(":not_a_real_emoji:", &[]).is_none());
+    }
+
+    #[test]
+    fn detects_only_the_configured_invocation_role() {
+        let mentioned_roles = [RoleId::new(10), RoleId::new(20)];
+        assert!(is_invocation_role_mentioned(Some(20), &mentioned_roles));
+        assert!(!is_invocation_role_mentioned(Some(30), &mentioned_roles));
+        assert!(!is_invocation_role_mentioned(None, &mentioned_roles));
+    }
+
+    #[test]
+    fn threads_inherit_their_parent_channel_setting() {
+        let thread_id = ChannelId::new(10);
+        let parent_id = ChannelId::new(20);
+        assert_eq!(
+            inherited_settings_channel_id(thread_id, Some(parent_id), ChannelType::PublicThread),
+            parent_id
+        );
+        assert_eq!(
+            inherited_settings_channel_id(thread_id, Some(parent_id), ChannelType::PrivateThread),
+            parent_id
+        );
+        assert_eq!(
+            inherited_settings_channel_id(thread_id, Some(parent_id), ChannelType::Text),
+            thread_id
+        );
     }
 }

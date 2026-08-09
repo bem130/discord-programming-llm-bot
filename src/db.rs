@@ -116,6 +116,52 @@ impl Database {
             .collect()
     }
 
+    pub async fn invocation_role_id(&self, guild_id: u64) -> Result<Option<u64>> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT invocation_role_id FROM guild_settings WHERE guild_id = ?",
+        )
+        .bind(guild_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to read invocation role setting")?
+        .map(parse_id)
+        .transpose()
+    }
+
+    pub async fn set_invocation_role(
+        &self,
+        guild_id: u64,
+        role_id: u64,
+        updated_by: u64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO guild_settings (guild_id, invocation_role_id, updated_by)
+            VALUES (?, ?, ?)
+            ON CONFLICT (guild_id) DO UPDATE SET
+                invocation_role_id = excluded.invocation_role_id,
+                updated_by = excluded.updated_by,
+                updated_at = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(guild_id.to_string())
+        .bind(role_id.to_string())
+        .bind(updated_by.to_string())
+        .execute(&self.pool)
+        .await
+        .context("failed to update invocation role setting")?;
+        Ok(())
+    }
+
+    pub async fn clear_invocation_role(&self, guild_id: u64) -> Result<()> {
+        sqlx::query("DELETE FROM guild_settings WHERE guild_id = ?")
+            .bind(guild_id.to_string())
+            .execute(&self.pool)
+            .await
+            .context("failed to clear invocation role setting")?;
+        Ok(())
+    }
+
     pub async fn record_message(&self, message: &IncomingMessage) -> Result<()> {
         let mut transaction = self.pool.begin().await?;
         let result = sqlx::query(
@@ -247,6 +293,21 @@ mod tests {
             ChannelMode::Auto
         );
         assert_eq!(database.channel_settings(1).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invocation_role_can_be_set_replaced_and_cleared() {
+        let database = test_database().await;
+        assert_eq!(database.invocation_role_id(1).await.unwrap(), None);
+
+        database.set_invocation_role(1, 10, 99).await.unwrap();
+        assert_eq!(database.invocation_role_id(1).await.unwrap(), Some(10));
+
+        database.set_invocation_role(1, 20, 99).await.unwrap();
+        assert_eq!(database.invocation_role_id(1).await.unwrap(), Some(20));
+
+        database.clear_invocation_role(1).await.unwrap();
+        assert_eq!(database.invocation_role_id(1).await.unwrap(), None);
     }
 
     #[tokio::test]

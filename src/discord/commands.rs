@@ -3,6 +3,7 @@ use serenity::all::{
     ChannelId, CommandDataOption, CommandDataOptionValue, CommandInteraction, CommandOptionType,
     Context, CreateAllowedMentions, CreateCommand, CreateCommandOption, CreateInteractionResponse,
     CreateInteractionResponseFollowup, CreateInteractionResponseMessage, GuildId, Permissions,
+    RoleId,
 };
 
 use crate::{db::Database, delivery::split_message, model::ChannelMode};
@@ -42,12 +43,32 @@ pub fn ai_command() -> CreateCommand {
         )
         .required(false),
     );
+    let role = CreateCommandOption::new(
+        CommandOptionType::SubCommand,
+        "role",
+        "Botを呼び出すサーバー共通Roleを設定または解除します",
+    )
+    .add_sub_option(
+        CreateCommandOption::new(CommandOptionType::String, "action", "実行する操作")
+            .required(true)
+            .add_string_choice("設定", "set")
+            .add_string_choice("解除", "clear"),
+    )
+    .add_sub_option(
+        CreateCommandOption::new(
+            CommandOptionType::Role,
+            "target",
+            "設定するRole（actionがsetの場合は必須）",
+        )
+        .required(false),
+    );
 
     CreateCommand::new("ai")
         .description("プログラミング講師AIの設定を管理します")
         .default_member_permissions(Permissions::MANAGE_GUILD)
         .dm_permission(false)
         .add_option(channel)
+        .add_option(role)
         .add_option(status)
 }
 
@@ -81,10 +102,62 @@ pub async fn handle_ai_command(
         ("channel", CommandDataOptionValue::SubCommand(options)) => {
             set_channel(context, command, configured_guild_id, database, options).await
         }
+        ("role", CommandDataOptionValue::SubCommand(options)) => {
+            configure_invocation_role(context, command, configured_guild_id, database, options)
+                .await
+        }
         ("status", CommandDataOptionValue::SubCommand(options)) => {
             show_status(context, command, configured_guild_id, database, options).await
         }
         _ => bail!("unknown /ai subcommand"),
+    }
+}
+
+async fn configure_invocation_role(
+    context: &Context,
+    command: &CommandInteraction,
+    guild_id: GuildId,
+    database: &Database,
+    options: &[CommandDataOption],
+) -> Result<()> {
+    match string_option(options, "action").context("missing role action")? {
+        "set" => {
+            let Some(role_id) = role_option(options, "target") else {
+                respond_public(
+                    context,
+                    command,
+                    "設定するRoleを `target` に指定してください。",
+                )
+                .await?;
+                return Ok(());
+            };
+            if role_id.get() == guild_id.get() {
+                respond_public(
+                    context,
+                    command,
+                    "`@everyone` は呼び出しRoleに設定できません。専用Roleを指定してください。",
+                )
+                .await?;
+                return Ok(());
+            }
+            database
+                .set_invocation_role(guild_id.get(), role_id.get(), command.user.id.get())
+                .await?;
+            respond_public(
+                context,
+                command,
+                &format!(
+                    "<@&{}> をBot呼び出しRoleに設定しました。直接メンションと同じように扱います。",
+                    role_id.get()
+                ),
+            )
+            .await
+        }
+        "clear" => {
+            database.clear_invocation_role(guild_id.get()).await?;
+            respond_public(context, command, "Bot呼び出しRoleの設定を解除しました。").await
+        }
+        _ => bail!("unknown role action"),
     }
 }
 
@@ -98,7 +171,8 @@ async fn set_channel(
     let mode = string_option(options, "mode")
         .context("missing mode")?
         .parse::<ChannelMode>()?;
-    let channel_id = channel_option(options, "target").unwrap_or(command.channel_id);
+    let requested_channel_id = channel_option(options, "target").unwrap_or(command.channel_id);
+    let channel_id = super::configuration_channel_id(context, requested_channel_id).await?;
     database
         .set_channel_mode(
             guild_id.get(),
@@ -128,7 +202,8 @@ async fn show_status(
     database: &Database,
     options: &[CommandDataOption],
 ) -> Result<()> {
-    let content = if let Some(channel_id) = channel_option(options, "target") {
+    let content = if let Some(requested_channel_id) = channel_option(options, "target") {
+        let channel_id = super::configuration_channel_id(context, requested_channel_id).await?;
         let mode = database
             .channel_mode(guild_id.get(), channel_id.get())
             .await?;
@@ -140,20 +215,23 @@ async fn show_status(
         )
     } else {
         let settings = database.channel_settings(guild_id.get()).await?;
+        let invocation_role = database.invocation_role_id(guild_id.get()).await?;
+        let mut lines = vec!["現在のAI設定:".to_owned()];
+        lines.push(match invocation_role {
+            Some(role_id) => format!("- Bot呼び出しRole: <@&{role_id}>"),
+            None => "- Bot呼び出しRole: 未設定".to_owned(),
+        });
         if settings.is_empty() {
-            "設定済みチャンネルはありません。すべてのチャンネルは既定で `off` です。".to_owned()
+            lines.push("- 設定済みチャンネルなし（すべてのチャンネルは既定で `off`）".to_owned());
         } else {
-            let mut lines = vec![
-                "現在のAIアクセス設定:".to_owned(),
-                "（一覧にないチャンネルは `off` です）".to_owned(),
-            ];
+            lines.push("- チャンネル設定（一覧にないチャンネルは `off`）:".to_owned());
             lines.extend(
                 settings
                     .into_iter()
-                    .map(|setting| format!("- <#{}>: `{}`", setting.channel_id, setting.mode)),
+                    .map(|setting| format!("  - <#{}>: `{}`", setting.channel_id, setting.mode)),
             );
-            lines.join("\n")
         }
+        lines.join("\n")
     };
 
     respond_public(context, command, &content).await
@@ -219,6 +297,17 @@ fn channel_option(options: &[CommandDataOption], name: &str) -> Option<ChannelId
             .then_some(&option.value)
             .and_then(|value| match value {
                 CommandDataOptionValue::Channel(channel_id) => Some(*channel_id),
+                _ => None,
+            })
+    })
+}
+
+fn role_option(options: &[CommandDataOption], name: &str) -> Option<RoleId> {
+    options.iter().find_map(|option| {
+        (option.name == name)
+            .then_some(&option.value)
+            .and_then(|value| match value {
+                CommandDataOptionValue::Role(role_id) => Some(*role_id),
                 _ => None,
             })
     })

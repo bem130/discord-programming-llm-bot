@@ -6,6 +6,8 @@
 
 - 必須の `DISCORD_GUILD_ID` と一致する1サーバーだけで動作
 - `/ai channel` でチャンネルごとに `off`、`read_only`、`mention`、`auto` を設定
+- `/ai role` でBotを呼び出すサーバー共通Roleを設定
+- threadとforum postでは親チャンネルのAIアクセス設定を継承
 - `/ai status` で単一チャンネルまたはサーバー全体の設定を確認
 - スラッシュコマンドの応答は公開。ephemeral応答は使用しない
 - SQLiteに許可チャンネルの会話を保存し、直近の会話をチャンネル横断で参照
@@ -62,8 +64,6 @@ Botのinstall scopeには `bot` と `applications.commands` を指定します�
 
 threadを使わない場合は `117824` まで削減できます。
 
-提示されていた `2885513648405584` は動作しますが過剰です。上記に加え、Manage Channels、Send TTS Messages、Manage Messages、Manage Threads、Create Public/Private Threads、Send Voice Messages、Send Polls、Pin Messagesを含みます。このBotはチャンネル・メッセージ・thread・pinの管理を行わないため、それらは外すべきです。`Manage Guild` はBot自身には付与せず、`/ai` を実行する利用者側の権限として検査します。
-
 リアクションは通常リアクションのみです。スーパーリアクションは使用しません。標準絵文字のshortcodeはUnicodeへ変換し、`:custom_name:` は対象サーバーで利用可能な同名カスタム絵文字へ解決します。
 
 ## 設定
@@ -110,6 +110,7 @@ cargo run --release
 /ai channel mode:読み取りのみ target:#learning-log
 /ai channel mode:メンション時に返信 target:#questions
 /ai channel mode:自動返信 target:#pair-programming
+/ai role action:設定 target:@aibot
 /ai status
 ```
 
@@ -119,6 +120,10 @@ cargo run --release
 - `read_only`: 会話と対応添付をサーバー共有コンテキストへ保存するが、応答・リアクションはしない
 - `mention`: 保存し、Botが明示的にメンションされた場合だけ必ず応答する
 - `auto`: 保存し、メンションまたはBotへの返信には必ず応答する。それ以外はAIの介入scoreが `0.85` 以上なら応答し、短い反応だけで十分ならリアクションを付ける
+
+設定したRoleへのメンションも、Botユーザーへの直接メンションと同じ明示呼び出しとして扱います。Role設定の解除は `/ai role action:解除` です。一般ユーザーがRoleをメンションできるようにするには、Discord側でそのRoleをmentionableにするか、利用者にRoleをメンションできる権限が必要です。
+
+thread内のメッセージはthread IDではなく親チャンネルのモードで判定します。会話の保存先情報と返信先は実際のthreadのままなので、親チャンネルが `mention` または `auto` ならthread内でも同じ動作をします。thread内で `/ai channel` や `/ai status target:` を実行した場合も親チャンネルを対象にします。
 
 `/ai` はDiscord側のdefault member permissionと実行時検査の両方で、Manage Server権限を持つ利用者だけに制限しています。
 
