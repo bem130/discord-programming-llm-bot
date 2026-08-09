@@ -6,11 +6,7 @@ use serenity::all::{
     RoleId,
 };
 
-use crate::{
-    db::Database,
-    delivery::split_message,
-    model::{ChannelMode, MemoryKind, MemoryStatus},
-};
+use crate::{db::Database, delivery::split_message, model::ChannelMode};
 
 pub fn ai_command() -> CreateCommand {
     let channel = CreateCommandOption::new(
@@ -66,50 +62,20 @@ pub fn ai_command() -> CreateCommand {
         )
         .required(false),
     );
-    let memory_add = CreateCommandOption::new(
-        CommandOptionType::SubCommand,
-        "add",
-        "確認済みの重要情報をサーバー共有メモリへ追加します",
-    )
-    .add_sub_option(
-        CreateCommandOption::new(CommandOptionType::String, "kind", "メモリの種類")
-            .required(true)
-            .add_string_choice("運用フィードバック", "feedback")
-            .add_string_choice("プロジェクト情報・判断", "project")
-            .add_string_choice("参考資料", "reference"),
-    )
-    .add_sub_option(
-        CreateCommandOption::new(CommandOptionType::String, "title", "短い識別名").required(true),
-    )
-    .add_sub_option(
-        CreateCommandOption::new(CommandOptionType::String, "summary", "毎回参照する短い要約")
-            .required(true),
-    )
-    .add_sub_option(
-        CreateCommandOption::new(
-            CommandOptionType::String,
-            "content",
-            "必要時に参照する詳細と判断理由",
-        )
-        .required(true),
-    );
     let memory_list = CreateCommandOption::new(
         CommandOptionType::SubCommand,
         "list",
-        "メモリ候補・有効メモリ・期限切れを一覧表示します",
+        "有効メモリと期限切れメモリを一覧表示します",
     );
-    let memory_approve = memory_id_subcommand("approve", "AIが提案したメモリ候補を承認します");
     let memory_review =
         memory_id_subcommand("review", "内容を確認したメモリの期限を30日延長します");
-    let memory_remove = memory_id_subcommand("remove", "メモリまたは候補を無効化します");
+    let memory_remove = memory_id_subcommand("remove", "メモリを無効化します");
     let memory = CreateCommandOption::new(
         CommandOptionType::SubCommandGroup,
         "memory",
         "サーバー共有の長期メモリを管理します",
     )
-    .add_sub_option(memory_add)
     .add_sub_option(memory_list)
-    .add_sub_option(memory_approve)
     .add_sub_option(memory_review)
     .add_sub_option(memory_remove);
 
@@ -185,42 +151,9 @@ async fn handle_memory(
         bail!("invalid memory action");
     };
     match action.name.as_str() {
-        "add" => {
-            let kind = string_option(arguments, "kind")
-                .context("missing memory kind")?
-                .parse::<MemoryKind>()?;
-            let title = string_option(arguments, "title").context("missing memory title")?;
-            let summary = string_option(arguments, "summary").context("missing memory summary")?;
-            let content = string_option(arguments, "content").context("missing memory content")?;
-            if let Some(problem) = validate_memory_text(title, summary, content) {
-                return respond_public(context, command, problem).await;
-            }
-            let id = database
-                .create_memory(
-                    guild_id.get(),
-                    kind,
-                    title,
-                    summary,
-                    content,
-                    MemoryStatus::Active,
-                    command.user.id.get(),
-                    Some(command.channel_id.get()),
-                    None,
-                )
-                .await?;
-            respond_public(
-                context,
-                command,
-                &format!(
-                    "メモリ `#{id}`（`{kind}`）を追加しました。30日以内に `/ai memory review` で再確認してください。"
-                ),
-            )
-            .await
-        }
         "list" => {
             let memories = database.list_memories(guild_id.get()).await?;
-            let mut lines =
-                vec!["サーバー共有メモリ（候補は承認されるまでAI回答に使われません）:".to_owned()];
+            let mut lines = vec!["AIが管理するサーバー共有メモリ:".to_owned()];
             if memories.is_empty() {
                 lines.push("- なし".to_owned());
             } else {
@@ -237,20 +170,6 @@ async fn handle_memory(
                 }));
             }
             respond_public(context, command, &lines.join("\n")).await
-        }
-        "approve" => {
-            let id = memory_id(arguments)?;
-            let changed = database.approve_memory(guild_id.get(), id).await?;
-            respond_public(
-                context,
-                command,
-                if changed {
-                    "候補を承認し、有効な共有メモリにしました。"
-                } else {
-                    "承認可能な候補が見つかりません。IDと状態を確認してください。"
-                },
-            )
-            .await
         }
         "review" => {
             let id = memory_id(arguments)?;
@@ -282,19 +201,6 @@ async fn handle_memory(
         }
         _ => bail!("unknown memory action"),
     }
-}
-
-fn validate_memory_text(title: &str, summary: &str, content: &str) -> Option<&'static str> {
-    if title.trim().is_empty() || summary.trim().is_empty() || content.trim().is_empty() {
-        return Some("title、summary、contentには空でない文字列を指定してください。");
-    }
-    if title.chars().count() > 100
-        || summary.chars().count() > 300
-        || content.chars().count() > 3_000
-    {
-        return Some("長さの上限はtitle 100文字、summary 300文字、content 3000文字です。");
-    }
-    None
 }
 
 fn memory_id(options: &[CommandDataOption]) -> Result<i64> {

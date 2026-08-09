@@ -18,7 +18,6 @@ const MAX_SEARCH_PATTERN_CHARS: usize = 256;
 const SEARCH_PAGE_SIZE: i64 = 500;
 const MAX_SEARCH_RESULTS: u32 = 20;
 const MAX_SEARCH_EXCERPT_CHARS: usize = 800;
-const MAX_PENDING_MEMORY_CANDIDATES: i64 = 100;
 
 #[derive(Clone)]
 pub struct Database {
@@ -381,19 +380,6 @@ impl Database {
         source_channel_id: Option<u64>,
         source_message_id: Option<u64>,
     ) -> Result<i64> {
-        if status == MemoryStatus::Candidate {
-            let candidate_count = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM guild_memories WHERE guild_id = ? AND status = 'candidate'",
-            )
-            .bind(guild_id.to_string())
-            .fetch_one(&self.pool)
-            .await
-            .context("failed to count pending memory candidates")?;
-            anyhow::ensure!(
-                candidate_count < MAX_PENDING_MEMORY_CANDIDATES,
-                "too many pending memory candidates; an administrator must review them"
-            );
-        }
         let active = status == MemoryStatus::Active;
         let id = sqlx::query_scalar::<_, i64>(
             r#"
@@ -471,23 +457,6 @@ impl Database {
         .context("failed to load active guild memories")?;
 
         rows.into_iter().map(memory_from_row).collect()
-    }
-
-    pub async fn approve_memory(&self, guild_id: u64, memory_id: i64) -> Result<bool> {
-        let result = sqlx::query(
-            r#"
-            UPDATE guild_memories
-            SET status = 'active', reviewed_at = CURRENT_TIMESTAMP,
-                review_after = datetime('now', '+30 days'), updated_at = CURRENT_TIMESTAMP
-            WHERE guild_id = ? AND id = ? AND status = 'candidate'
-            "#,
-        )
-        .bind(guild_id.to_string())
-        .bind(memory_id)
-        .execute(&self.pool)
-        .await
-        .context("failed to approve guild memory")?;
-        Ok(result.rows_affected() == 1)
     }
 
     pub async fn review_memory(&self, guild_id: u64, memory_id: i64) -> Result<bool> {
@@ -833,7 +802,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_candidate_requires_approval_and_can_be_reviewed() {
+    async fn active_memory_can_be_reviewed_and_removed() {
         let database = test_database().await;
         let id = database
             .create_memory(
@@ -842,16 +811,13 @@ mod tests {
                 "error policy",
                 "Use Result",
                 "Failures are explicit in the return type.",
-                MemoryStatus::Candidate,
+                MemoryStatus::Active,
                 99,
                 Some(100),
                 Some(10),
             )
             .await
             .unwrap();
-        assert!(database.active_memories(1).await.unwrap().is_empty());
-
-        assert!(database.approve_memory(1, id).await.unwrap());
         let active = database.active_memories(1).await.unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].id, id);
