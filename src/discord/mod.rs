@@ -37,6 +37,7 @@ const CONTEXT_MESSAGE_LIMIT: u32 = 40;
 const MAX_TEXT_ATTACHMENT_BYTES: u32 = 512 * 1024;
 const MAX_MULTIMODAL_ATTACHMENT_BYTES: u32 = 20 * 1024 * 1024;
 const TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
+const GENERATION_FAILURE_MESSAGE: &str = "回答生成またはレビューが一時的に完了しませんでした。少し待ってから、もう一度呼び出してください。";
 
 pub struct DiscordBot {
     guild_id: GuildId,
@@ -327,7 +328,11 @@ impl DiscordBot {
             message.id.get(),
             self.runner.as_deref(),
         )
-        .await?;
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(?error, "answer generation or review exhausted all retries");
+            GENERATION_FAILURE_MESSAGE.to_owned()
+        });
         self.send_answer(context, message, settings_channel_id, &answer)
             .await
     }

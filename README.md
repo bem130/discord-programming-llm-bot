@@ -97,7 +97,7 @@ CODE_EXECUTION_TIMEOUT_SECS=20
 
 `OPENROUTER_REPLY_DECISION_MODELS` はアプリケーションが左から順に試すmodel IDです。既定値は、無料かつstructured outputs対応の `google/gemma-4-26b-a4b-it:free`、`nvidia/nemotron-3-super-120b-a12b:free`、利用可能な無料modelを選ぶ `openrouter/free`、最後に通常回答と同じLunaです。HTTPエラーだけでなく、不正JSONや空応答でも次のmodelへ進みます。JSON要求にはOpenRouterのResponse Healingも使用します。`inclusionai/ling-3.0-tiny:free` は2026-08-09時点の公式model一覧ではstructured outputs非対応のため、既定の判定modelからは外しています。
 
-最後のLunaまで到達すると有料推論になるため、完全無料に限定する場合は末尾のLunaを削除できます。その場合、全無料modelが失敗した自動介入は安全側に倒して発言しませんが、明示メンションへの返信保証は維持されます。
+最後のLunaまで到達すると有料推論になるため、完全無料に限定する場合は末尾のLunaを削除できます。その場合、全無料modelが失敗した自動介入は安全側に倒して発言しません。明示メンションは判定失敗時にも返信対象となり、回答生成・レビューまで全再試行に失敗した場合は固定の障害案内を返信します。
 
 `REPLY_DECISION_THRESHOLD` は `0.0` から `1.0` の範囲で設定します。値を上げるほど自発的な介入が減ります。
 
