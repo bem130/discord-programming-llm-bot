@@ -28,12 +28,13 @@ use crate::{
     context::{ResponseMode, RuntimeBot, RuntimeContext, RuntimeLocation, RuntimeUser},
     db::Database,
     delivery::split_message,
-    model::{IncomingAttachment, IncomingMessage},
+    model::{IncomingAttachment, IncomingMessage, RecentChannelActivity},
     runner::SharedCodeRunner,
     tutor::{decide_action, generate_reviewed_answer},
 };
 
 const RECENT_CONTEXT_MESSAGE_LIMIT: u32 = 5;
+const RECENT_ACTIVE_CHANNEL_LIMIT: u32 = 12;
 const MAX_TEXT_ATTACHMENT_BYTES: u32 = 512 * 1024;
 const MAX_MULTIMODAL_ATTACHMENT_BYTES: u32 = 20 * 1024 * 1024;
 const TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
@@ -233,12 +234,17 @@ impl DiscordBot {
             return Ok(());
         }
 
+        let channel_name = match message.channel_id.to_channel(&context.http).await {
+            Ok(Channel::Guild(channel)) => Some(channel.name),
+            _ => None,
+        };
         let attachments = extract_attachments(&message.attachments).await;
         self.database
             .record_message(&IncomingMessage {
                 discord_message_id: message.id.get(),
                 guild_id: self.guild_id.get(),
                 channel_id: message.channel_id.get(),
+                channel_name: channel_name.clone(),
                 settings_channel_id: settings_channel_id.get(),
                 author_id: message.author.id.get(),
                 author_name: message.author.name.clone(),
@@ -250,9 +256,21 @@ impl DiscordBot {
             .await?;
 
         let _response_guard = self.response_lock.lock().await;
-        let guild_context = self
+        let current_channel_context = self
             .database
-            .recent_context(self.guild_id.get(), RECENT_CONTEXT_MESSAGE_LIMIT)
+            .recent_channel_context(
+                self.guild_id.get(),
+                message.channel_id.get(),
+                RECENT_CONTEXT_MESSAGE_LIMIT,
+            )
+            .await?;
+        let recent_active_channels = self
+            .database
+            .recent_active_channels(
+                self.guild_id.get(),
+                message.channel_id.get(),
+                RECENT_ACTIVE_CHANNEL_LIMIT,
+            )
             .await?;
         let bot_user_id = self.bot_user_id.load(Ordering::Relaxed);
         let user_mentioned = bot_user_id != 0
@@ -273,6 +291,23 @@ impl DiscordBot {
                 .as_ref()
                 .is_some_and(|referenced| referenced.author.id.get() == bot_user_id);
         let forced_reply = mentioned || (mode == crate::model::ChannelMode::Auto && direct);
+        let response_mode = if direct {
+            ResponseMode::Direct
+        } else if mentioned {
+            ResponseMode::Invoked
+        } else {
+            ResponseMode::Passive
+        };
+        let runtime_context = self
+            .runtime_context(
+                context,
+                message,
+                response_mode,
+                bot_user_id,
+                channel_name,
+                recent_active_channels,
+            )
+            .await;
         let custom_emojis = match self.guild_id.emojis(&context.http).await {
             Ok(emojis) => emojis,
             Err(error) => {
@@ -290,7 +325,8 @@ impl DiscordBot {
             mode,
             forced_reply,
             self.intervention_threshold,
-            &guild_context,
+            &current_channel_context,
+            &runtime_context,
             &emoji_names,
         )
         .await?;
@@ -308,20 +344,10 @@ impl DiscordBot {
         }
 
         let _typing = TypingGuard::start(context, message.channel_id);
-        let response_mode = if direct {
-            ResponseMode::Direct
-        } else if mentioned {
-            ResponseMode::Invoked
-        } else {
-            ResponseMode::Passive
-        };
-        let runtime_context = self
-            .runtime_context(context, message, response_mode, bot_user_id)
-            .await;
         let memories = self.database.active_memories(self.guild_id.get()).await?;
         let answer = generate_reviewed_answer(
             self.model.as_ref(),
-            &guild_context,
+            &current_channel_context,
             &runtime_context,
             &memories,
             &self.database,
@@ -343,6 +369,8 @@ impl DiscordBot {
         message: &Message,
         mode: ResponseMode,
         bot_user_id: u64,
+        channel_name: Option<String>,
+        recent_active_channels: Vec<RecentChannelActivity>,
     ) -> RuntimeContext {
         let server_name = self
             .guild_id
@@ -350,10 +378,6 @@ impl DiscordBot {
             .await
             .ok()
             .map(|guild| guild.name);
-        let channel_name = match message.channel_id.to_channel(&context.http).await {
-            Ok(Channel::Guild(channel)) => Some(channel.name),
-            _ => None,
-        };
         let bot_name = self
             .bot_name
             .read()
@@ -384,6 +408,7 @@ impl DiscordBot {
                     .clone()
                     .unwrap_or_else(|| message.author.name.clone()),
             },
+            recent_active_channels,
         }
     }
 
@@ -437,6 +462,7 @@ impl DiscordBot {
                     discord_message_id: sent.id.get(),
                     guild_id: self.guild_id.get(),
                     channel_id: sent.channel_id.get(),
+                    channel_name: None,
                     settings_channel_id: settings_channel_id.get(),
                     author_id: sent.author.id.get(),
                     author_name: sent.author.name,

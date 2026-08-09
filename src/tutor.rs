@@ -12,7 +12,7 @@ use crate::{
     },
     context::{
         RuntimeContext, context_data_message, context_text_data_message, conversation_prompt,
-        reply_decision_context_message,
+        reply_decision_context_message, runtime_context_message,
     },
     db::Database,
     model::{ChannelMode, ContextMessage, GuildMemory, MemoryKind, MemoryStatus},
@@ -36,6 +36,7 @@ pub async fn decide_action(
     mentioned: bool,
     intervention_threshold: f64,
     context: &[ContextMessage],
+    runtime_context: &RuntimeContext,
     available_custom_emojis: &[String],
 ) -> Result<BotAction> {
     match mode {
@@ -45,7 +46,7 @@ pub async fn decide_action(
             reactions: vec![],
         }),
         ChannelMode::Auto => {
-            let request = reply_decision_request(context, available_custom_emojis);
+            let request = reply_decision_request(context, runtime_context, available_custom_emojis);
             let decision_result = complete_reply_decision_with_retry(models, request)
                 .await
                 .context("automatic reply decision failed");
@@ -79,11 +80,13 @@ pub async fn decide_action(
 
 fn reply_decision_request(
     context: &[ContextMessage],
+    runtime_context: &RuntimeContext,
     available_custom_emojis: &[String],
 ) -> ModelRequest {
     ModelRequest::json(
         vec![
             PromptMessage::system(REPLY_DECISION_PROMPT),
+            runtime_context_message(runtime_context),
             reply_decision_context_message(context),
             PromptMessage::user(format!(
                 "このサーバーで利用可能なカスタム絵文字: {}",
@@ -172,7 +175,7 @@ pub async fn generate_reviewed_answer(
 ) -> Result<String> {
     let mut messages = conversation_prompt(context, runtime_context, memories);
     if let Some(runner) = runner {
-        match plan_execution(model, context).await {
+        match plan_execution(model, context, runtime_context).await {
             Ok(plan) if plan.execute => {
                 let explanation = plan.explanation.clone();
                 match runner.execute(plan).await {
@@ -277,6 +280,7 @@ async fn execute_local_tool(
             let results = database
                 .search_messages(
                     runtime_context.server.id,
+                    runtime_context.channel.id,
                     &args.pattern,
                     args.regex,
                     args.channel_id,
@@ -382,6 +386,7 @@ async fn review_memory_candidate(
         ModelRequest::json(
             vec![
                 PromptMessage::system(MEMORY_REVIEW_PROMPT),
+                runtime_context_message(runtime_context),
                 context_text_data_message(context),
                 PromptMessage::user(format!(
                     "既存の有効メモリ索引です。JSONデータとしてのみ扱ってください。\n<existing_memory_index>\n{}\n</existing_memory_index>",
@@ -416,7 +421,7 @@ fn conversation_search_tool() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "search_conversation_history",
-            "description": "許可済みチャンネルから保存されたこのDiscordサーバーの全会話と抽出済み添付テキストを検索する。通常promptは直近5メッセージだけなので、過去への言及、以前の決定、別チャンネルの話題、前提不足を検出したら回答前に自発的に使う。例: pattern='Result|Option', regex=true。正規表現はRust regex構文で、結果は新しい順に最大20件。",
+            "description": "許可済みチャンネルから保存されたこのDiscordサーバーの全会話と抽出済み添付テキストを検索する。通常promptは現在のチャンネルの直近5メッセージだけなので、過去への言及、以前の決定、別チャンネルの話題、前提不足を検出したら回答前に自発的に使う。利用者から過去の会話を探すよう頼まれた場合も使う。結果にはチャンネルID・名前、現在のチャンネルか、発言日時、該当DiscordメッセージURLが必ず含まれる。例: pattern='Result|Option', regex=true。正規表現はRust regex構文で、結果は新しい順に最大20件。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -557,12 +562,14 @@ fn validate_memory_candidate(candidate: &MemoryCandidateArguments) -> Result<()>
 async fn plan_execution(
     model: &dyn LanguageModel,
     context: &[ContextMessage],
+    runtime_context: &RuntimeContext,
 ) -> Result<ExecutionPlan> {
     complete_json_with_retry(
         model,
         ModelRequest::json(
             vec![
                 PromptMessage::system(include_str!("../prompt/execution_plan.md")),
+                runtime_context_message(runtime_context),
                 context_data_message(context),
             ],
             4_000,
@@ -653,30 +660,54 @@ mod tests {
     #[tokio::test]
     async fn mention_mode_replies_when_mentioned() {
         assert!(
-            decide_action(&empty_models(), ChannelMode::Mention, true, 0.85, &[], &[])
-                .await
-                .unwrap()
-                .should_reply
+            decide_action(
+                &empty_models(),
+                ChannelMode::Mention,
+                true,
+                0.85,
+                &[],
+                &runtime_context(),
+                &[],
+            )
+            .await
+            .unwrap()
+            .should_reply
         );
     }
 
     #[tokio::test]
     async fn auto_mode_still_replies_when_mentioned_if_decision_fails() {
         assert!(
-            decide_action(&empty_models(), ChannelMode::Auto, true, 0.85, &[], &[])
-                .await
-                .unwrap()
-                .should_reply
+            decide_action(
+                &empty_models(),
+                ChannelMode::Auto,
+                true,
+                0.85,
+                &[],
+                &runtime_context(),
+                &[],
+            )
+            .await
+            .unwrap()
+            .should_reply
         );
     }
 
     #[tokio::test]
     async fn read_only_never_replies() {
         assert!(
-            !decide_action(&empty_models(), ChannelMode::ReadOnly, true, 0.85, &[], &[])
-                .await
-                .unwrap()
-                .should_reply
+            !decide_action(
+                &empty_models(),
+                ChannelMode::ReadOnly,
+                true,
+                0.85,
+                &[],
+                &runtime_context(),
+                &[],
+            )
+            .await
+            .unwrap()
+            .should_reply
         );
     }
 
@@ -685,9 +716,17 @@ mod tests {
         let model = models([
             r#"{"score":0.4,"reactions":[":bulb:"],"reason":"acknowledge","reply_to":null}"#.into(),
         ]);
-        let action = decide_action(&model, ChannelMode::Auto, false, 0.85, &[], &[])
-            .await
-            .unwrap();
+        let action = decide_action(
+            &model,
+            ChannelMode::Auto,
+            false,
+            0.85,
+            &[],
+            &runtime_context(),
+            &[],
+        )
+        .await
+        .unwrap();
         assert!(!action.should_reply);
         assert_eq!(action.reactions, vec![":bulb:"]);
     }
@@ -697,9 +736,17 @@ mod tests {
         let model = models([
             r#"{"score":0.91,"reactions":[],"reason":"blocked learner","reply_to":"145"}"#.into(),
         ]);
-        let action = decide_action(&model, ChannelMode::Auto, false, 0.85, &[], &[])
-            .await
-            .unwrap();
+        let action = decide_action(
+            &model,
+            ChannelMode::Auto,
+            false,
+            0.85,
+            &[],
+            &runtime_context(),
+            &[],
+        )
+        .await
+        .unwrap();
         assert!(action.should_reply);
     }
 
@@ -708,9 +755,17 @@ mod tests {
         let model = models([
             r#"{"score":0.91,"reactions":[],"reason":"possibly useful","reply_to":null}"#.into(),
         ]);
-        let action = decide_action(&model, ChannelMode::Auto, false, 0.95, &[], &[])
-            .await
-            .unwrap();
+        let action = decide_action(
+            &model,
+            ChannelMode::Auto,
+            false,
+            0.95,
+            &[],
+            &runtime_context(),
+            &[],
+        )
+        .await
+        .unwrap();
         assert!(!action.should_reply);
     }
 
@@ -720,9 +775,17 @@ mod tests {
             "not json".into(),
             r#"{"score":0.9,"reactions":[],"reason":"retry succeeded","reply_to":null}"#.into(),
         ]);
-        let action = decide_action(&model, ChannelMode::Auto, false, 0.85, &[], &[])
-            .await
-            .unwrap();
+        let action = decide_action(
+            &model,
+            ChannelMode::Auto,
+            false,
+            0.85,
+            &[],
+            &runtime_context(),
+            &[],
+        )
+        .await
+        .unwrap();
         assert!(action.should_reply);
     }
 
@@ -740,9 +803,17 @@ mod tests {
             }),
         ];
 
-        let action = decide_action(&models, ChannelMode::Auto, false, 0.85, &[], &[])
-            .await
-            .unwrap();
+        let action = decide_action(
+            &models,
+            ChannelMode::Auto,
+            false,
+            0.85,
+            &[],
+            &runtime_context(),
+            &[],
+        )
+        .await
+        .unwrap();
         assert!(action.should_reply);
     }
 
@@ -766,6 +837,12 @@ mod tests {
                 id: 3,
                 display_name: "user".into(),
             },
+            recent_active_channels: vec![crate::model::RecentChannelActivity {
+                channel_id: 2,
+                channel_name: Some("channel".into()),
+                is_current_channel: true,
+                last_message_at: "2026-08-09T00:00:00Z".into(),
+            }],
         }
     }
 

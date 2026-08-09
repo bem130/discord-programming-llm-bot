@@ -104,6 +104,9 @@ pub struct GuildMemory {
 pub struct ConversationSearchResult {
     pub message_id: u64,
     pub channel_id: u64,
+    pub channel_name: Option<String>,
+    pub is_current_channel: bool,
+    pub message_url: String,
     pub author_id: u64,
     pub author_name: String,
     pub content: String,
@@ -194,6 +197,7 @@ pub struct IncomingMessage {
     pub discord_message_id: u64,
     pub guild_id: u64,
     pub channel_id: u64,
+    pub channel_name: Option<String>,
     pub settings_channel_id: u64,
     pub author_id: u64,
     pub author_name: String,
@@ -201,6 +205,14 @@ pub struct IncomingMessage {
     pub is_bot: bool,
     pub created_at: String,
     pub attachments: Vec<IncomingAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecentChannelActivity {
+    pub channel_id: u64,
+    pub channel_name: Option<String>,
+    pub is_current_channel: bool,
+    pub last_message_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

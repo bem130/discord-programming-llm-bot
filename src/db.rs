@@ -9,10 +9,11 @@ use sqlx::{
 
 use crate::model::{
     ChannelMode, ChannelSetting, ContextAttachment, ContextMessage, ConversationSearchResult,
-    GuildMemory, IncomingMessage, MemoryKind, MemoryStatus,
+    GuildMemory, IncomingMessage, MemoryKind, MemoryStatus, RecentChannelActivity,
 };
 
 const MAX_CONTEXT_MESSAGES: u32 = 80;
+const MAX_RECENT_ACTIVE_CHANNELS: u32 = 20;
 const MAX_MEMORY_INDEX_ENTRIES: u32 = 100;
 const MAX_SEARCH_PATTERN_CHARS: usize = 256;
 const SEARCH_PAGE_SIZE: i64 = 500;
@@ -171,6 +172,21 @@ impl Database {
 
     pub async fn record_message(&self, message: &IncomingMessage) -> Result<()> {
         let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO guild_channels (guild_id, channel_id, channel_name)
+            VALUES (?, ?, ?)
+            ON CONFLICT (guild_id, channel_id) DO UPDATE SET
+                channel_name = COALESCE(excluded.channel_name, guild_channels.channel_name),
+                updated_at = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(message.guild_id.to_string())
+        .bind(message.channel_id.to_string())
+        .bind(&message.channel_name)
+        .execute(&mut *transaction)
+        .await
+        .context("failed to update channel catalog")?;
         let result = sqlx::query(
             r#"
             INSERT INTO messages (
@@ -313,7 +329,12 @@ impl Database {
         Ok(deleted)
     }
 
-    pub async fn recent_context(&self, guild_id: u64, limit: u32) -> Result<Vec<ContextMessage>> {
+    pub async fn recent_channel_context(
+        &self,
+        guild_id: u64,
+        channel_id: u64,
+        limit: u32,
+    ) -> Result<Vec<ContextMessage>> {
         let limit = limit.clamp(1, MAX_CONTEXT_MESSAGES);
         let rows = sqlx::query(
             r#"
@@ -324,16 +345,17 @@ impl Database {
                 ON c.guild_id = m.guild_id
                AND c.channel_id = COALESCE(m.settings_channel_id, m.channel_id)
                AND c.mode != 'off'
-            WHERE m.guild_id = ?
+            WHERE m.guild_id = ? AND m.channel_id = ?
             ORDER BY id DESC
             LIMIT ?
             "#,
         )
         .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
         .bind(limit)
         .fetch_all(&self.pool)
         .await
-        .context("failed to load guild context")?;
+        .context("failed to load current channel context")?;
 
         let mut messages = Vec::with_capacity(rows.len());
         for row in rows.into_iter().rev() {
@@ -365,6 +387,49 @@ impl Database {
         }
 
         Ok(messages)
+    }
+
+    pub async fn recent_active_channels(
+        &self,
+        guild_id: u64,
+        current_channel_id: u64,
+        limit: u32,
+    ) -> Result<Vec<RecentChannelActivity>> {
+        let limit = limit.clamp(1, MAX_RECENT_ACTIVE_CHANNELS);
+        let rows = sqlx::query(
+            r#"
+            SELECT m.channel_id, gc.channel_name, MAX(m.created_at) AS last_message_at,
+                   MAX(m.id) AS last_message_row_id
+            FROM messages AS m
+            INNER JOIN channel_settings AS c
+                ON c.guild_id = m.guild_id
+               AND c.channel_id = COALESCE(m.settings_channel_id, m.channel_id)
+               AND c.mode != 'off'
+            LEFT JOIN guild_channels AS gc
+                ON gc.guild_id = m.guild_id AND gc.channel_id = m.channel_id
+            WHERE m.guild_id = ?
+            GROUP BY m.channel_id, gc.channel_name
+            ORDER BY last_message_row_id DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(guild_id.to_string())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load recent active channels")?;
+
+        rows.into_iter()
+            .map(|row| {
+                let channel_id = parse_id(row.try_get("channel_id")?)?;
+                Ok(RecentChannelActivity {
+                    channel_id,
+                    channel_name: row.try_get("channel_name")?,
+                    is_current_channel: channel_id == current_channel_id,
+                    last_message_at: row.try_get("last_message_at")?,
+                })
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -508,6 +573,7 @@ impl Database {
     pub async fn search_messages(
         &self,
         guild_id: u64,
+        current_channel_id: u64,
         pattern: &str,
         regex: bool,
         channel_id: Option<u64>,
@@ -537,8 +603,8 @@ impl Database {
         while results.len() < limit {
             let rows = sqlx::query(
                 r#"
-                SELECT m.id, m.discord_message_id, m.channel_id, m.author_id,
-                       m.author_name, m.content, m.is_bot, m.created_at,
+                 SELECT m.id, m.discord_message_id, m.channel_id, gc.channel_name, m.author_id,
+                        m.author_name, m.content, m.is_bot, m.created_at,
                        COALESCE(GROUP_CONCAT(COALESCE(a.extracted_text, ''), char(10)), '')
                            AS attachment_text
                 FROM messages AS m
@@ -546,7 +612,9 @@ impl Database {
                     ON c.guild_id = m.guild_id
                    AND c.channel_id = COALESCE(m.settings_channel_id, m.channel_id)
                    AND c.mode != 'off'
-                LEFT JOIN message_attachments AS a ON a.message_id = m.id
+                 LEFT JOIN message_attachments AS a ON a.message_id = m.id
+                 LEFT JOIN guild_channels AS gc
+                    ON gc.guild_id = m.guild_id AND gc.channel_id = m.channel_id
                 WHERE m.guild_id = ? AND m.id < ?
                   AND (? IS NULL OR m.channel_id = ?)
                   AND (? IS NULL OR m.author_id = ?)
@@ -573,14 +641,19 @@ impl Database {
 
             for row in &rows {
                 before_id = row.try_get("id")?;
+                let message_id = parse_id(row.try_get("discord_message_id")?)?;
+                let channel_id = parse_id(row.try_get("channel_id")?)?;
                 let content: String = row.try_get("content")?;
                 let attachment_text: String = row.try_get("attachment_text")?;
                 if !matcher.is_match(&content) && !matcher.is_match(&attachment_text) {
                     continue;
                 }
                 results.push(ConversationSearchResult {
-                    message_id: parse_id(row.try_get("discord_message_id")?)?,
-                    channel_id: parse_id(row.try_get("channel_id")?)?,
+                    message_id,
+                    channel_id,
+                    channel_name: row.try_get("channel_name")?,
+                    is_current_channel: channel_id == current_channel_id,
+                    message_url: discord_message_url(guild_id, channel_id, message_id),
                     author_id: parse_id(row.try_get("author_id")?)?,
                     author_name: row.try_get("author_name")?,
                     content: matching_excerpt(&content, &matcher),
@@ -598,6 +671,10 @@ impl Database {
 
         Ok(results)
     }
+}
+
+fn discord_message_url(guild_id: u64, channel_id: u64, message_id: u64) -> String {
+    format!("https://discord.com/channels/{guild_id}/{channel_id}/{message_id}")
 }
 
 fn matching_excerpt(text: &str, matcher: &regex::Regex) -> String {
@@ -702,7 +779,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_is_shared_across_channels_and_chronological() {
+    async fn current_channel_context_is_isolated_and_chronological() {
         let database = test_database().await;
         database
             .set_channel_mode(1, 100, ChannelMode::ReadOnly, 99)
@@ -712,18 +789,23 @@ mod tests {
             .set_channel_mode(1, 200, ChannelMode::Mention, 99)
             .await
             .unwrap();
-        for (message_id, channel_id, content) in [(10, 100, "first"), (11, 200, "second")] {
+        for (message_id, channel_id, channel_name, content, created_at) in [
+            (10, 100, "questions", "first", "2026-08-09T00:00:00Z"),
+            (11, 200, "projects", "other channel", "2026-08-09T00:01:00Z"),
+            (12, 100, "questions", "third", "2026-08-09T00:02:00Z"),
+        ] {
             database
                 .record_message(&IncomingMessage {
                     discord_message_id: message_id,
                     guild_id: 1,
                     channel_id,
+                    channel_name: Some(channel_name.into()),
                     settings_channel_id: channel_id,
                     author_id: 99,
                     author_name: "learner".into(),
                     content: content.into(),
                     is_bot: false,
-                    created_at: "2026-08-09T00:00:00Z".into(),
+                    created_at: created_at.into(),
                     attachments: if message_id == 10 {
                         vec![IncomingAttachment {
                             filename: "main.rs".into(),
@@ -740,11 +822,20 @@ mod tests {
                 .unwrap();
         }
 
-        let context = database.recent_context(1, 10).await.unwrap();
+        let context = database.recent_channel_context(1, 100, 10).await.unwrap();
         assert_eq!(context.len(), 2);
         assert_eq!(context[0].channel_id, 100);
         assert_eq!(context[0].attachments[0].filename, "main.rs");
-        assert_eq!(context[1].channel_id, 200);
+        assert_eq!(context[1].content, "third");
+
+        let active = database.recent_active_channels(1, 100, 10).await.unwrap();
+        assert_eq!(active.len(), 2);
+        assert_eq!(active[0].channel_id, 100);
+        assert_eq!(active[0].channel_name.as_deref(), Some("questions"));
+        assert!(active[0].is_current_channel);
+        assert_eq!(active[0].last_message_at, "2026-08-09T00:02:00Z");
+        assert_eq!(active[1].channel_id, 200);
+        assert!(!active[1].is_current_channel);
     }
 
     #[tokio::test]
@@ -759,6 +850,7 @@ mod tests {
                 discord_message_id: 10,
                 guild_id: 1,
                 channel_id: 100,
+                channel_name: Some("questions".into()),
                 settings_channel_id: 100,
                 author_id: 99,
                 author_name: "learner".into(),
@@ -783,22 +875,34 @@ mod tests {
         );
         assert!(
             database
-                .search_messages(1, r"Result<.*>", true, None, None, true, 10)
+                .search_messages(1, 100, r"Result<.*>", true, None, None, true, 10)
                 .await
                 .unwrap()
-                .iter()
-                .any(|result| result.message_id == 10)
+                .first()
+                .is_some_and(|result| {
+                    result.message_id == 10
+                        && result.channel_name.as_deref() == Some("questions")
+                        && result.is_current_channel
+                        && result.created_at == "2026-08-09T00:00:00Z"
+                        && result.message_url == "https://discord.com/channels/1/100/10"
+                })
         );
         assert!(
             database
-                .search_messages(1, "old typo", false, None, None, true, 10)
+                .search_messages(1, 100, "old typo", false, None, None, true, 10)
                 .await
                 .unwrap()
                 .is_empty()
         );
 
         assert!(database.delete_message(10).await.unwrap());
-        assert!(database.recent_context(1, 10).await.unwrap().is_empty());
+        assert!(
+            database
+                .recent_channel_context(1, 100, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
