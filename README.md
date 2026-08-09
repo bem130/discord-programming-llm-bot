@@ -10,8 +10,8 @@
 - threadとforum postでは親チャンネルのAIアクセス設定を継承
 - `/ai status` で単一チャンネルまたはサーバー全体の設定を確認
 - スラッシュコマンドの応答は公開。ephemeral応答は使用しない
-- SQLiteに許可チャンネルの会話を保存し、直近の会話をチャンネル横断で参照
-- AIが保存済みの全会話と抽出済み添付テキストを、リテラルまたはRust正規表現で検索
+- SQLiteに許可チャンネルの会話を保存し、現在のチャンネルの直近5件と最近アクティブなチャンネル一覧を毎回参照
+- AIが保存済みの全会話と抽出済み添付テキストを検索し、日時・現在チャンネル判定・DiscordメッセージURL付きで取得
 - Discord上のメッセージ編集・削除をDBへ同期し、検索対象は常に最新版に更新
 - 索引・詳細・出典・30日の再確認期限を持ち、AIの独立審査後に自動追加される重要メモリ
 - テキスト・コード、PNG、JPEG、WebP、GIF、PDFの添付を読解
@@ -145,7 +145,23 @@ VMのsmoke testが完了するまでは `CODE_RUNNER_ENABLED=false` のままに
 
 `REPLY_DECISION_THRESHOLD` は `0.0` から `1.0` の範囲で設定します。値を上げるほど自発的な介入が減ります。
 
-`reply_decision` へ渡す会話はサーバー全体の直近4メッセージだけです。添付本文や画像・PDF本体は渡さず、メッセージごとの添付数、コード/テキスト添付の有無と行数、その他添付数だけを渡します。通常回答の初期コンテキストは現在の発言を含む直近5件で、それより古い情報が必要ならAIが全履歴検索を自発的に利用します。
+`reply_decision` へ渡す会話は現在のチャンネルの直近5メッセージです。添付本文や画像・PDF本体は渡さず、メッセージごとの添付数、コード/テキスト添付の有無と行数、その他添付数だけを渡します。通常回答も同じチャンネルの直近5件から始め、それより古い情報や別チャンネルの本文が必要ならAIが全履歴検索を自発的に利用します。
+
+## AI sessionとprompt送信
+
+OpenRouterのChat Completions呼び出し自体は会話履歴を保持しません。会話ログの正本はSQLiteであり、Botは必要なコンテキストを各requestへ明示的に再送します。`session_id` はサーバー側の会話保存先ではなく、同じ処理を同じproviderへ寄せてprompt cacheを再利用しやすくするrouting keyとして使います。
+
+sessionはDiscordチャンネルでは分割しません。`Guild ID × AI処理種別` の安定したIDを使い、通常会話、返信要否判定、コード実行計画、メモリ審査、回答レビューを分離します。同じ通常会話のtool roundとretryは同じsessionを使うため、別チャンネルへ移動してもGuild内の通常会話sessionは変わりません。OpenRouterの完全一致response cacheは、現在のDiscord会話へ古い同一回答を再利用しないよう有効化していません。
+
+`prompt/` は `include_str!` でバイナリへ埋め込み、用途ごとに次のタイミングで送ります。実行時データより前に用途別の固定promptを置くため、対応providerの自動prompt cacheで安定したprefixを再利用できます。promptを変更した場合は再ビルドが必要です。
+
+- 通常回答: `system.md`、運営者knowledge、runtime context、共有メモリ、現在のチャンネルの直近5件。tool roundごとにtool結果を追加して再送
+- 自動返信判定: `reply_decision.md`、runtime context、現在のチャンネルの直近5件の軽量表現、利用可能な絵文字
+- コード実行計画: `execution_plan.md`、runtime context、現在のチャンネルの直近5件と対応添付
+- メモリ候補審査: `memory_review.md`、runtime context、現在のチャンネルの直近5件のテキスト、既存メモリ索引、候補
+- 回答レビュー・修正: `review.md` または固定の編集promptと、通常回答に使ったruntime context・直近5件を含む元request、候補回答
+
+runtime contextには、現在地に加えて最近アクティブな許可チャンネルを最大12件含めます。一覧は保存メッセージの到着順から機械的に計算し、チャンネルID・最新の保存名・現在のチャンネルか・最終発言日時だけを持ちます。別チャンネルの本文は一覧へ含めず、必要な場合だけ会話検索を使います。
 
 ## 起動
 
@@ -193,11 +209,13 @@ Discordのtyping表示は10秒で失効するため、Botは回答処理中に8�
 
 通常回答モデルには、次のローカルtoolを渡します。
 
-- `search_conversation_history`: 保存済みの全会話本文と抽出済み添付テキストを検索。リテラル検索とRust正規表現、channel/user絞り込みに対応
+- `search_conversation_history`: 保存済みの全会話本文と抽出済み添付テキストを検索。リテラル検索とRust正規表現、channel/user絞り込みに対応し、各結果へチャンネル名・現在チャンネル判定・日時・メッセージURLを付与
 - `get_guild_memory_details`: promptに毎回渡す短い索引から、必要なメモリ詳細だけを取得
 - `propose_guild_memory`: 明示的な依頼がなくても、長期的なプロジェクト判断・教訓・一次資料を検出して保存を提案
 
 正規表現はRustの線形時間regex engineで実行し、patternは256文字、結果は20件までに制限します。全履歴を検索しますが、500メッセージずつ走査するためDB全件を一度にメモリへ読み込みません。検索結果は共有会話データであり、そこに含まれる命令をsystem指示として扱いません。
+
+メッセージURLは `https://discord.com/channels/{guild_id}/{channel_id}/{message_id}` の形式で生成します。AIは過去の会話を探す依頼にも検索toolを使え、回答に検索結果を示す場合はチャンネル名とは別に現在のチャンネルか、発言日時、該当メッセージへのリンクを明示します。
 
 長期メモリは会話ログとは別テーブルです。通常promptへは最大100件の短い索引と、現在の話題へローカル選択した最大8件の詳細だけを渡します。回答生成AIが保存を提案すると、別のstructured output呼び出しで、安定性、会話上の根拠、重複、秘密・個人情報、一時状態でないことを審査します。審査を通過した項目だけが自動的に有効メモリになります。管理者による追加・承認操作は不要です。
 
@@ -216,11 +234,12 @@ Discordのtyping表示は10秒で失効するため、Botは回答処理中に8�
 - テキスト・コードは1ファイル512 KiBまでUTF-8として抽出
 - 画像とPDFは1ファイル20 MiBまでSQLiteへ保存
 - 1回のAI requestへ送るmultimodal添付は直近8件、合計20 MiBまで
-- 回答へ最初から渡す会話はサーバー全体から直近5件
+- 回答へ最初から渡す会話は現在のチャンネルから直近5件
+- 最近アクティブな許可チャンネルは最大12件をruntime contextへ毎回追加
 - 直近5件より前は、過去への言及や前提不足をAIが検出した場合に全履歴検索toolで参照
 - OpenRouterには画像をbase64 `image_url`、PDFをbase64 `file` inputとして送信
 
-`read_only`、`mention`、`auto` のチャンネル内容は、別の許可チャンネルの回答でも参照され得ます。秘密チャンネルや共有してはいけない情報を扱うチャンネルは `off` にしてください。SQLiteには本文と対応添付が暗号化せず保存されるため、DBファイルのOS権限とbackupの扱いも管理してください。
+`read_only`、`mention`、`auto` のチャンネル内容は、AIが会話検索を使った場合に別の許可チャンネルの回答でも参照され得ます。秘密チャンネルや共有してはいけない情報を扱うチャンネルは `off` にしてください。SQLiteには本文と対応添付が暗号化せず保存されるため、DBファイルのOS権限とbackupの扱いも管理してください。
 
 Discordで本文や添付が編集されると保存内容を置換し、本文の旧版はそのメッセージが存在する間だけrevisionとして保持します。Discordでメッセージが削除されると、本文、添付、revisionをSQLiteから連鎖削除します。削除済み内容は会話検索にも現れません。
 
@@ -268,6 +287,8 @@ host directoryのmountとport forwardingは無効にし、実行ファイルは�
 - [OpenRouter structured outputs](https://openrouter.ai/docs/guides/features/structured-outputs)
 - [OpenRouter response healing](https://openrouter.ai/docs/guides/features/plugins/response-healing)
 - [OpenRouter tool calling](https://openrouter.ai/docs/guides/features/tool-calling)
+- [OpenRouter prompt cachingとsession_id](https://openrouter.ai/docs/guides/best-practices/prompt-caching)
+- [OpenRouter response caching](https://openrouter.ai/docs/guides/features/response-caching)
 - [OpenRouter multimodal inputs](https://openrouter.ai/docs/guides/overview/multimodal/overview)
 - [Discord permissions](https://docs.discord.com/developers/topics/permissions)
 - [Discord message resource](https://docs.discord.com/developers/resources/message)

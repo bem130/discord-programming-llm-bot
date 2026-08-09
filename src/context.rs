@@ -357,6 +357,12 @@ mod tests {
         };
         assert!(text.contains("他の利用者へ強制したりしない"));
         assert!(text.contains("運営者 @bem130 の設計指針"));
+
+        let PromptContent::Text(runtime_text) = &messages[2].content else {
+            panic!("expected runtime context text");
+        };
+        assert!(runtime_text.contains(r#""recent_active_channels""#));
+        assert!(runtime_text.contains(r#""is_current_channel":true"#));
     }
 
     #[test]

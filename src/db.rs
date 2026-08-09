@@ -398,8 +398,8 @@ impl Database {
         let limit = limit.clamp(1, MAX_RECENT_ACTIVE_CHANNELS);
         let rows = sqlx::query(
             r#"
-            SELECT m.channel_id, gc.channel_name, MAX(m.created_at) AS last_message_at,
-                   MAX(m.id) AS last_message_row_id
+            SELECT m.channel_id, gc.channel_name, m.created_at AS last_message_at,
+                   m.id AS last_message_row_id
             FROM messages AS m
             INNER JOIN channel_settings AS c
                 ON c.guild_id = m.guild_id
@@ -408,7 +408,12 @@ impl Database {
             LEFT JOIN guild_channels AS gc
                 ON gc.guild_id = m.guild_id AND gc.channel_id = m.channel_id
             WHERE m.guild_id = ?
-            GROUP BY m.channel_id, gc.channel_name
+              AND m.id = (
+                  SELECT MAX(latest.id)
+                  FROM messages AS latest
+                  WHERE latest.guild_id = m.guild_id
+                    AND latest.channel_id = m.channel_id
+              )
             ORDER BY last_message_row_id DESC
             LIMIT ?
             "#,
@@ -836,6 +841,19 @@ mod tests {
         assert_eq!(active[0].last_message_at, "2026-08-09T00:02:00Z");
         assert_eq!(active[1].channel_id, 200);
         assert!(!active[1].is_current_channel);
+
+        let search = database
+            .search_messages(1, 100, "other channel", false, None, None, true, 10)
+            .await
+            .unwrap();
+        assert_eq!(search.len(), 1);
+        assert_eq!(search[0].channel_name.as_deref(), Some("projects"));
+        assert!(!search[0].is_current_channel);
+        assert_eq!(search[0].created_at, "2026-08-09T00:01:00Z");
+        assert_eq!(
+            search[0].message_url,
+            "https://discord.com/channels/1/200/11"
+        );
     }
 
     #[tokio::test]

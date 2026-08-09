@@ -117,6 +117,28 @@ pub struct ModelRequest {
     pub web_search: bool,
     pub tools: Vec<Value>,
     pub reasoning: Option<Value>,
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiSessionPurpose {
+    Conversation,
+    ReplyDecision,
+    CodeExecution,
+    MemoryReview,
+    ResponseReview,
+}
+
+impl AiSessionPurpose {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Conversation => "conversation",
+            Self::ReplyDecision => "reply-decision",
+            Self::CodeExecution => "code-execution",
+            Self::MemoryReview => "memory-review",
+            Self::ResponseReview => "response-review",
+        }
+    }
 }
 
 impl ModelRequest {
@@ -128,6 +150,7 @@ impl ModelRequest {
             web_search: false,
             tools: vec![],
             reasoning: None,
+            session_id: None,
         }
     }
 
@@ -139,6 +162,7 @@ impl ModelRequest {
             web_search: true,
             tools: vec![],
             reasoning: None,
+            session_id: None,
         }
     }
 
@@ -158,6 +182,7 @@ impl ModelRequest {
             web_search: false,
             tools: vec![],
             reasoning: None,
+            session_id: None,
         }
     }
 
@@ -171,6 +196,14 @@ impl ModelRequest {
             "effort": effort,
             "exclude": true
         }));
+        self
+    }
+
+    pub fn with_guild_session(mut self, guild_id: u64, purpose: AiSessionPurpose) -> Self {
+        self.session_id = Some(format!(
+            "discord-learn-programming-bot:guild:{guild_id}:{}",
+            purpose.as_str()
+        ));
         self
     }
 }
@@ -277,6 +310,7 @@ impl LanguageModel for OpenRouterClient {
         let payload = ChatCompletionRequest {
             model: &self.model,
             models: (!self.fallback_models.is_empty()).then_some(self.fallback_models.as_slice()),
+            session_id: request.session_id.as_deref(),
             messages: &request.messages,
             max_tokens: request.max_tokens,
             response_format,
@@ -537,6 +571,8 @@ struct ChatCompletionRequest<'a> {
     model: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     models: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
     messages: &'a [PromptMessage],
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -653,6 +689,52 @@ mod tests {
         assert_eq!(
             request.reasoning,
             Some(json!({ "effort": "none", "exclude": true }))
+        );
+    }
+
+    #[test]
+    fn guild_sessions_are_stable_and_never_use_discord_channel_ids() {
+        let first =
+            ModelRequest::text(vec![], 100).with_guild_session(123, AiSessionPurpose::Conversation);
+        let second =
+            ModelRequest::text(vec![], 100).with_guild_session(123, AiSessionPurpose::Conversation);
+        let review = ModelRequest::text(vec![], 100)
+            .with_guild_session(123, AiSessionPurpose::ResponseReview);
+
+        assert_eq!(first.session_id, second.session_id);
+        assert_eq!(
+            first.session_id.as_deref(),
+            Some("discord-learn-programming-bot:guild:123:conversation")
+        );
+        assert_ne!(first.session_id, review.session_id);
+        assert!(
+            first
+                .session_id
+                .as_deref()
+                .is_some_and(|session_id| !session_id.contains("channel"))
+        );
+    }
+
+    #[test]
+    fn openrouter_payload_includes_session_id() {
+        let messages = vec![PromptMessage::system("stable prompt")];
+        let payload = serde_json::to_value(ChatCompletionRequest {
+            model: "test/model",
+            models: None,
+            session_id: Some("discord-learn-programming-bot:guild:123:conversation"),
+            messages: &messages,
+            max_tokens: 100,
+            response_format: None,
+            provider: None,
+            plugins: None,
+            reasoning: None,
+            tools: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            payload["session_id"],
+            "discord-learn-programming-bot:guild:123:conversation"
         );
     }
 

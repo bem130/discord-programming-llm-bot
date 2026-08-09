@@ -6,9 +6,9 @@ use serde_json::json;
 
 use crate::{
     ai::{
-        LanguageModel, ModelRequest, PromptMessage, SharedLanguageModel, complete_json,
-        complete_json_with_retry, complete_response_with_retry, model_error_is_global_fatal,
-        model_retry_delay,
+        AiSessionPurpose, LanguageModel, ModelRequest, PromptMessage, SharedLanguageModel,
+        complete_json, complete_json_with_retry, complete_response_with_retry,
+        model_error_is_global_fatal, model_retry_delay,
     },
     context::{
         RuntimeContext, context_data_message, context_text_data_message, conversation_prompt,
@@ -115,6 +115,7 @@ fn reply_decision_request(
             "additionalProperties": false
         }),
     )
+    .with_guild_session(runtime_context.server.id, AiSessionPurpose::ReplyDecision)
 }
 
 async fn complete_reply_decision_with_retry(
@@ -205,7 +206,7 @@ pub async fn generate_reviewed_answer(
     )
     .await
     .context("answer generation failed")?;
-    review_response(model, &messages, generated)
+    review_response(model, runtime_context.server.id, &messages, generated)
         .await
         .context("generated answer did not pass review")
 }
@@ -222,7 +223,8 @@ async fn generate_with_tools(
         let request = ModelRequest::text_with_web_search(messages.clone(), ANSWER_MAX_TOKENS)
             .with_tool(conversation_search_tool())
             .with_tool(memory_details_tool())
-            .with_tool(memory_candidate_tool());
+            .with_tool(memory_candidate_tool())
+            .with_guild_session(runtime_context.server.id, AiSessionPurpose::Conversation);
         let response = complete_response_with_retry(model, request, "answer_generation").await?;
         if response.tool_calls.is_empty() {
             return response
@@ -409,7 +411,11 @@ async fn review_memory_candidate(
                 "additionalProperties": false
             }),
         )
-        .with_reasoning_effort("none"),
+        .with_reasoning_effort("none")
+        .with_guild_session(
+            runtime_context.server.id,
+            AiSessionPurpose::MemoryReview,
+        ),
         "memory_review",
     )
     .await
@@ -606,7 +612,8 @@ async fn plan_execution(
                 "required": ["execute", "explanation", "system_packages", "files", "commands"],
                 "additionalProperties": false
             }),
-        ),
+        )
+        .with_guild_session(runtime_context.server.id, AiSessionPurpose::CodeExecution),
         "code_execution_plan",
     )
     .await
@@ -625,6 +632,7 @@ struct ReplyDecision {
 mod tests {
     use std::{collections::VecDeque, sync::Mutex};
 
+    use crate::ai::PromptContent;
     use anyhow::anyhow;
     use async_trait::async_trait;
 
@@ -844,6 +852,20 @@ mod tests {
                 last_message_at: "2026-08-09T00:00:00Z".into(),
             }],
         }
+    }
+
+    #[test]
+    fn reply_decision_gets_runtime_context_and_a_guild_scoped_session() {
+        let request = reply_decision_request(&[], &runtime_context(), &[]);
+
+        assert_eq!(
+            request.session_id.as_deref(),
+            Some("discord-learn-programming-bot:guild:1:reply-decision")
+        );
+        let PromptContent::Text(runtime) = &request.messages[1].content else {
+            panic!("expected runtime context text");
+        };
+        assert!(runtime.contains(r#""recent_active_channels""#));
     }
 
     #[tokio::test]

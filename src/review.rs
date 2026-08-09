@@ -3,7 +3,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::ai::{
-    LanguageModel, ModelRequest, PromptMessage, complete_json_with_retry, complete_with_retry,
+    AiSessionPurpose, LanguageModel, ModelRequest, PromptMessage, complete_json_with_retry,
+    complete_with_retry,
 };
 
 const REVIEW_PROMPT: &str = include_str!("../prompt/review.md");
@@ -47,6 +48,7 @@ pub fn static_issues(candidate: &str) -> Vec<StaticIssue> {
 
 pub async fn review_response(
     model: &dyn LanguageModel,
+    guild_id: u64,
     original_messages: &[PromptMessage],
     generated: String,
 ) -> Result<String> {
@@ -63,18 +65,25 @@ pub async fn review_response(
                 .map(StaticIssue::instruction)
                 .collect::<Vec<_>>()
                 .join("; ");
-            candidate = repair(model, original_messages, &candidate, &feedback).await?;
+            candidate = repair(model, guild_id, original_messages, &candidate, &feedback).await?;
             continue;
         }
 
-        let verdict = semantic_review(model, original_messages, &candidate).await?;
+        let verdict = semantic_review(model, guild_id, original_messages, &candidate).await?;
         if verdict.approved {
             return Ok(candidate);
         }
         if attempt == MAX_REPAIR_ATTEMPTS {
             bail!("response failed semantic review after repair attempts");
         }
-        candidate = repair(model, original_messages, &candidate, &verdict.feedback).await?;
+        candidate = repair(
+            model,
+            guild_id,
+            original_messages,
+            &candidate,
+            &verdict.feedback,
+        )
+        .await?;
     }
 
     unreachable!("review loop always returns or fails")
@@ -82,6 +91,7 @@ pub async fn review_response(
 
 async fn semantic_review(
     model: &dyn LanguageModel,
+    guild_id: u64,
     original_messages: &[PromptMessage],
     candidate: &str,
 ) -> Result<ReviewVerdict> {
@@ -107,7 +117,8 @@ async fn semantic_review(
                 "additionalProperties": false
             }),
         )
-        .with_reasoning_effort("none"),
+        .with_reasoning_effort("none")
+        .with_guild_session(guild_id, AiSessionPurpose::ResponseReview),
         "semantic_review",
     )
     .await
@@ -116,6 +127,7 @@ async fn semantic_review(
 
 async fn repair(
     model: &dyn LanguageModel,
+    guild_id: u64,
     original_messages: &[PromptMessage],
     candidate: &str,
     feedback: &str,
@@ -129,7 +141,8 @@ async fn repair(
     )));
     complete_with_retry(
         model,
-        ModelRequest::text(messages, 4_000),
+        ModelRequest::text(messages, 4_000)
+            .with_guild_session(guild_id, AiSessionPurpose::ResponseReview),
         "response_repair",
     )
     .await
@@ -217,6 +230,7 @@ mod tests {
 
         let result = review_response(
             &model,
+            123,
             &[PromptMessage::user("compare")],
             "| A | B |\n| --- | --- |".to_owned(),
         )
