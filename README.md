@@ -211,7 +211,7 @@ Discordのtyping表示は10秒で失効するため、Botは回答処理中に8�
 - `search_conversation_history`: 保存済みの全会話本文と抽出済み添付テキストを検索。リテラル検索とRust正規表現、channel/user絞り込みに対応し、各結果へチャンネル名・現在チャンネル判定・日時・メッセージURLを付与
 - `get_guild_memory_details`: promptに毎回渡す短い索引から、必要なメモリ詳細だけを取得
 - `propose_guild_memory`: 明示的な依頼がなくても、長期的なプロジェクト判断・教訓・一次資料を検出して保存を提案
-- `execute_code_in_sandbox`: 隔離されたLima VM環境でコード（Rust, Python, C/C++, Go, Haskell, OCaml, Lean 4, Coq, Elm, Common Lisp, Lazy-K等）のコンパイル・検証・標準出力取得を実行
+- `execute_code_in_sandbox`: 隔離されたLima VM環境でコード（Rust, Python, C/C++, Go, JavaScript, TypeScript, Haskell, OCaml, Lean 4, Coq, Elm, Common Lisp, Lazy-K等）のコンパイル・検証・標準出力取得を実行
 - `get_channel_recent_messages`: 指定したDiscordチャンネルの直近メッセージをタイムライン順に取得。channel_idまたはchannel_nameで指定し、別チャンネルの文脈把握に利用
 - `explain_compiler_error`: `rustc --explain`を使ってRustエラーコード（E0382等）の公式解説をローカルで取得
 - `format_and_lint_code`: `rustfmt`（Rust）または`python -m py_compile`（Python）をホスト上で直接実行し、整形・構文チェック結果をVMなしで即返す

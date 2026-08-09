@@ -25,28 +25,69 @@ provision:
       set -eux -o pipefail
       export DEBIAN_FRONTEND=noninteractive
       apt-get update
+
+      # Node.js LTS via NodeSource (provides a current nodejs + npm)
+      curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+
       apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
-        cargo \
         cabal-install \
         coq \
         curl \
         git \
         ghc \
+        golang-go \
         libgmp-dev \
+        nodejs \
         ocaml \
         opam \
         pkg-config \
         python3 \
         python3-pip \
         python3-venv \
-        rustc \
-        sbcl
+        sbcl \
+        xz-utils
       apt-get clean
       rm -rf /var/lib/apt/lists/*
 
-      # Elm 0.19.1 — pre-compiled static binary, no Node.js required
+      # ── Rust toolchain via rustup (system-wide) ──────────────────────────────
+      # Install to /usr/local/{rustup,cargo} so all users share one toolchain.
+      export RUSTUP_HOME=/usr/local/rustup
+      export CARGO_HOME=/usr/local/cargo
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --default-toolchain stable
+      # Add wasm targets used by wasmtime/wasmer
+      /usr/local/cargo/bin/rustup target add wasm32-wasip1 wasm32-unknown-unknown
+      chmod -R a+rX /usr/local/rustup /usr/local/cargo
+      # Expose cargo/rustc/rustup on PATH for all users
+      cat > /etc/profile.d/rust.sh << 'RUSTEOF'
+      export RUSTUP_HOME=/usr/local/rustup
+      export CARGO_HOME=/usr/local/cargo
+      export PATH=/usr/local/cargo/bin:$PATH
+      RUSTEOF
+      # Symlink for non-login shells (e.g. sandbox runner)
+      ln -sf /usr/local/cargo/bin/cargo   /usr/local/bin/cargo
+      ln -sf /usr/local/cargo/bin/rustc   /usr/local/bin/rustc
+      ln -sf /usr/local/cargo/bin/rustup  /usr/local/bin/rustup
+      ln -sf /usr/local/cargo/bin/rustfmt /usr/local/bin/rustfmt
+      ln -sf /usr/local/cargo/bin/clippy-driver /usr/local/bin/clippy-driver 2>/dev/null || true
+
+      # ── wasmtime 36.0.0 (LTS) ────────────────────────────────────────────────
+      WASMTIME_VERSION="36.0.0"
+      curl -fsSL \
+        "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/wasmtime-v${WASMTIME_VERSION}-x86_64-linux.tar.xz" \
+        | tar -xJ -C /tmp
+      cp "/tmp/wasmtime-v${WASMTIME_VERSION}-x86_64-linux/wasmtime" /usr/local/bin/wasmtime
+      rm -rf "/tmp/wasmtime-v${WASMTIME_VERSION}-x86_64-linux"
+
+      # ── wasmer (latest stable) ────────────────────────────────────────────────
+      # Install to /usr/local so it's available to all users
+      export WASMER_DIR=/usr/local/wasmer
+      curl -fsSL https://get.wasmer.io | sh -s -- --prefix=/usr/local/wasmer
+      ln -sf /usr/local/wasmer/bin/wasmer /usr/local/bin/wasmer
+
+      # ── Elm 0.19.1 ───────────────────────────────────────────────────────────
       ELM_VERSION="0.19.1"
       curl -fsSL -o /tmp/elm.gz \
         "https://github.com/elm/compiler/releases/download/${ELM_VERSION}/binary-for-linux-64-bit.gz"
@@ -54,8 +95,8 @@ provision:
       chmod +x /tmp/elm
       mv /tmp/elm /usr/local/bin/elm
 
-      # Lazy-K interpreter (irori/lazyk) — build from source
-      LAZYK_COMMIT="7a13dcd"
+      # ── Lazy-K interpreter (irori/lazyk) ─────────────────────────────────────
+      LAZYK_COMMIT="35699d9"
       LAZYK_DIR="/tmp/lazyk-build"
       git clone https://github.com/irori/lazyk "$LAZYK_DIR"
       git -C "$LAZYK_DIR" checkout "$LAZYK_COMMIT"
@@ -63,14 +104,14 @@ provision:
       cp "$LAZYK_DIR/lazyk" /usr/local/bin/lazyk
       rm -rf "$LAZYK_DIR"
 
-  - mode: user
-    script: |
-      #!/bin/bash
-      set -eux -o pipefail
-      # Lean 4 via elan — downloads ~180 MiB toolchain on first use.
-      # Install elan and pre-fetch the stable toolchain so sandbox runs are offline.
+      # ── TypeScript / ts-node ─────────────────────────────────────────────────
+      npm install -g typescript ts-node
+
+      # ── Lean 4 via elan (system-wide) ────────────────────────────────────────
+      export ELAN_HOME=/usr/local/elan
       curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
-        | sh -s -- -y --default-toolchain leanprover/lean4:stable
-      # Verify
-      source "$HOME/.elan/env"
-      lean --version
+        | sh -s -- -y --no-modify-path --default-toolchain leanprover/lean4:stable
+      ln -sf /usr/local/elan/bin/lean  /usr/local/bin/lean
+      ln -sf /usr/local/elan/bin/lake  /usr/local/bin/lake
+      ln -sf /usr/local/elan/bin/elan  /usr/local/bin/elan
+      /usr/local/bin/lean --version

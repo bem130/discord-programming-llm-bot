@@ -645,7 +645,7 @@ fn code_execution_tool() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "execute_code_in_sandbox",
-            "description": "隔離されたLima VM環境でコードをコンパイル・実行する。コードの動作検証、コンパイルエラー確認、標準出力の取得が必要な場合に使用する。対応言語: Rust, Python, C/C++, Go, Haskell (ghc), OCaml, Lean 4 (lean/lake; ~/.elan/env を source すること), Coq, Elm 0.19.1, Common Lisp (sbcl), Lazy-K (lazyk) 等。",
+            "description": "隔離されたLima VM環境でコードをコンパイル・実行する。コードの動作検証、コンパイルエラー確認、標準出力の取得が必要な場合に使用する。対応言語: Rust, Python, C/C++, Go, JavaScript (node), TypeScript (ts-node/tsc), Haskell (ghc), OCaml, Lean 4 (lean/lake; ~/.elan/env を source すること), Coq, Elm 0.19.1, Common Lisp (sbcl), Lazy-K (lazyk) 等。",
             "parameters": {
                 "type": "object",
                 "properties": {
