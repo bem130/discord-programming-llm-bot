@@ -36,6 +36,7 @@ const MAX_TOOL_RESULT_HISTORY_CHARS: usize = 12_000;
 const MAX_TOOL_ARGUMENT_HISTORY_CHARS: usize = 8_000;
 const MAX_TOOL_TRANSCRIPT_CHARS: usize = 64_000;
 const MAX_REPLY_DECISION_ATTEMPTS: usize = 3;
+const EXPLICIT_REPLY_THRESHOLD: f64 = 0.25;
 #[cfg(not(test))]
 const REPLY_DECISION_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 #[cfg(test)]
@@ -49,7 +50,7 @@ pub trait ToolStatusSink: Send + Sync {
 pub async fn decide_action(
     models: &[SharedLanguageModel],
     mode: ChannelMode,
-    mentioned: bool,
+    explicit_request: bool,
     intervention_threshold: f64,
     context: &[ContextMessage],
     runtime_context: &RuntimeContext,
@@ -57,18 +58,15 @@ pub async fn decide_action(
 ) -> Result<BotAction> {
     match mode {
         ChannelMode::Off | ChannelMode::ReadOnly => Ok(BotAction::default()),
-        ChannelMode::Mention => Ok(BotAction {
-            should_reply: mentioned,
-            reactions: vec![],
-        }),
-        ChannelMode::Auto => {
+        ChannelMode::Mention if !explicit_request => Ok(BotAction::default()),
+        ChannelMode::Mention | ChannelMode::Auto => {
             let request = reply_decision_request(context, runtime_context, available_custom_emojis);
             let decision_result = complete_reply_decision_with_retry(models, request)
                 .await
                 .context("automatic reply decision failed");
             let decision = match decision_result {
                 Ok(decision) => decision,
-                Err(error) if mentioned => {
+                Err(error) if explicit_request => {
                     tracing::warn!(
                         error = %format!("{error:#}"),
                         "action decision failed; replying because bot was mentioned"
@@ -87,7 +85,12 @@ pub async fn decide_action(
                 "automatic reply decision completed"
             );
             Ok(BotAction {
-                should_reply: mentioned || decision.score >= intervention_threshold,
+                should_reply: decision.score
+                    >= if explicit_request {
+                        EXPLICIT_REPLY_THRESHOLD
+                    } else {
+                        intervention_threshold
+                    },
                 reactions: decision.reactions,
             })
         }
@@ -940,7 +943,7 @@ fn conversation_search_tool() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "search_conversation_history",
-            "description": "許可済みチャンネルから保存されたこのDiscordサーバーの全会話と抽出済み添付テキストを検索する。通常promptは現在のチャンネルの直近5メッセージだけなので、過去への言及、以前の決定、別チャンネルの話題、前提不足を検出したら回答前に自発的に使う。利用者から過去の会話を探すよう頼まれた場合も使う。結果にはチャンネルID・名前、現在のチャンネルか、発言日時、該当DiscordメッセージURLが必ず含まれる。例: pattern='Result|Option', regex=true。正規表現はRust regex構文で、結果は新しい順に最大20件。",
+            "description": "許可済みチャンネルから保存されたこのDiscordサーバーの全会話と抽出済み添付テキストを検索する。通常promptには現在のチャンネルの直近5件まで、またはそれより多い応答対象バッチ全件（最大80件）が含まれるため、それより前への言及、以前の決定、別チャンネルの話題、前提不足を検出したら回答前に自発的に使う。利用者から過去の会話を探すよう頼まれた場合も使う。結果にはチャンネルID・名前、現在のチャンネルか、発言日時、該当DiscordメッセージURLが必ず含まれる。例: pattern='Result|Option', regex=true。正規表現はRust regex構文で、結果は新しい順に最大20件。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1612,6 +1615,49 @@ mod tests {
             .unwrap()
             .should_reply
         );
+    }
+
+    #[tokio::test]
+    async fn mention_mode_can_decline_a_reply_when_no_response_is_needed() {
+        let model = models([
+            r#"{"score":0.1,"reactions":[":eyes:"],"reason":"acknowledgement only","reply_to":null}"#
+                .into(),
+        ]);
+        let action = decide_action(
+            &model,
+            ChannelMode::Mention,
+            true,
+            0.85,
+            &[],
+            &runtime_context(),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert!(!action.should_reply);
+        assert_eq!(action.reactions, vec![":eyes:"]);
+    }
+
+    #[tokio::test]
+    async fn mention_mode_uses_a_lower_threshold_than_automatic_intervention() {
+        let model = models([
+            r#"{"score":0.4,"reactions":[],"reason":"direct but lightweight request","reply_to":null}"#
+                .into(),
+        ]);
+        let action = decide_action(
+            &model,
+            ChannelMode::Mention,
+            true,
+            0.85,
+            &[],
+            &runtime_context(),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert!(action.should_reply);
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ use serenity::{
     gateway::{ActivityData, ShardMessenger},
 };
 use tokio::{
-    sync::{Mutex, oneshot},
+    sync::{Mutex, Notify, oneshot, watch},
     task::JoinHandle,
 };
 
@@ -31,15 +31,173 @@ use crate::{
     delivery::split_message,
     model::{IncomingAttachment, IncomingMessage, RecentChannelActivity},
     runner::SharedCodeRunner,
-    tutor::{ToolStatusSink, decide_action, generate_reviewed_answer},
+    tutor::{BotAction, ToolStatusSink, decide_action, generate_reviewed_answer},
 };
 
 const RECENT_CONTEXT_MESSAGE_LIMIT: u32 = 5;
+const MAX_CONVERSATION_BATCH_MESSAGES: usize = 80;
 const RECENT_ACTIVE_CHANNEL_LIMIT: u32 = 12;
 const MAX_TEXT_ATTACHMENT_BYTES: u32 = 512 * 1024;
 const MAX_MULTIMODAL_ATTACHMENT_BYTES: u32 = 20 * 1024 * 1024;
 const TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
+const CONVERSATION_BATCH_DELAY: Duration = Duration::from_millis(1_200);
 const GENERATION_FAILURE_MESSAGE: &str = "回答生成またはレビューが一時的に完了しませんでした。少し待ってから、もう一度呼び出してください。";
+
+#[derive(Clone)]
+struct PendingConversationMessage {
+    message: Message,
+    channel_name: Option<String>,
+    settings_channel_id: ChannelId,
+    mode: crate::model::ChannelMode,
+    mentioned: bool,
+    direct: bool,
+}
+
+struct ConversationBatch {
+    channel_id: u64,
+    generation: u64,
+    messages: Vec<PendingConversationMessage>,
+    updates: watch::Receiver<u64>,
+}
+
+struct ConversationTicket {
+    channel_id: u64,
+    generation: u64,
+    updates: watch::Receiver<u64>,
+}
+
+struct PreparedConversationResponse {
+    source: Message,
+    settings_channel_id: ChannelId,
+    action: BotAction,
+    custom_emojis: Vec<Emoji>,
+    answer: Option<String>,
+}
+
+struct ChannelConversationState {
+    generation: u64,
+    active_generation: Option<u64>,
+    pending: Vec<PendingConversationMessage>,
+    updates: watch::Sender<u64>,
+    availability: Arc<Notify>,
+}
+
+impl ChannelConversationState {
+    fn new() -> Self {
+        let (updates, _) = watch::channel(0);
+        Self {
+            generation: 0,
+            active_generation: None,
+            pending: vec![],
+            updates,
+            availability: Arc::new(Notify::new()),
+        }
+    }
+
+    fn advance_generation(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.updates.send_replace(self.generation);
+        self.generation
+    }
+
+    fn try_claim(&mut self, generation: u64) -> bool {
+        if self.generation == generation && self.active_generation.is_none() {
+            self.active_generation = Some(generation);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release(&mut self, generation: u64) {
+        if self.active_generation == Some(generation) {
+            self.active_generation = None;
+            self.availability.notify_waiters();
+        }
+    }
+}
+
+#[derive(Default)]
+struct ConversationCoordinator {
+    channels: Mutex<HashMap<u64, ChannelConversationState>>,
+}
+
+impl ConversationCoordinator {
+    async fn enqueue(&self, pending: PendingConversationMessage) -> ConversationTicket {
+        let channel_id = pending.message.channel_id.get();
+        let mut channels = self.channels.lock().await;
+        let state = channels
+            .entry(channel_id)
+            .or_insert_with(ChannelConversationState::new);
+        state.pending.push(pending);
+        let dropped = retain_latest(&mut state.pending, MAX_CONVERSATION_BATCH_MESSAGES);
+        if dropped > 0 {
+            tracing::warn!(
+                channel_id,
+                dropped,
+                "conversation batch exceeded its context limit; discarding oldest pending messages"
+            );
+        }
+        let generation = state.advance_generation();
+        ConversationTicket {
+            channel_id,
+            generation,
+            updates: state.updates.subscribe(),
+        }
+    }
+
+    async fn claim_after_delay(&self, ticket: ConversationTicket) -> Option<ConversationBatch> {
+        tokio::time::sleep(CONVERSATION_BATCH_DELAY).await;
+        loop {
+            let availability = {
+                let mut channels = self.channels.lock().await;
+                let state = channels.get_mut(&ticket.channel_id)?;
+                if state.generation != ticket.generation {
+                    return None;
+                }
+                if state.try_claim(ticket.generation) {
+                    return Some(ConversationBatch {
+                        channel_id: ticket.channel_id,
+                        generation: ticket.generation,
+                        messages: state.pending.clone(),
+                        updates: ticket.updates,
+                    });
+                }
+                Arc::clone(&state.availability).notified_owned()
+            };
+            availability.await;
+        }
+    }
+
+    async fn is_current(&self, batch: &ConversationBatch) -> bool {
+        self.channels
+            .lock()
+            .await
+            .get(&batch.channel_id)
+            .is_some_and(|state| state.generation == batch.generation)
+    }
+
+    async fn finish(&self, batch: &ConversationBatch, covered: bool) {
+        let mut channels = self.channels.lock().await;
+        let Some(state) = channels.get_mut(&batch.channel_id) else {
+            return;
+        };
+        state.release(batch.generation);
+        if covered {
+            let covered_ids: std::collections::HashSet<_> = batch
+                .messages
+                .iter()
+                .map(|pending| pending.message.id.get())
+                .collect();
+            state
+                .pending
+                .retain(|pending| !covered_ids.contains(&pending.message.id.get()));
+        }
+        if state.pending.is_empty() && state.active_generation.is_none() {
+            channels.remove(&batch.channel_id);
+        }
+    }
+}
 
 struct ToolStatusSinkGuard {
     shard: ShardMessenger,
@@ -135,7 +293,7 @@ pub struct DiscordBot {
     bot_owner_id: AtomicU64,
     bot_name: RwLock<String>,
     settings_channel_cache: RwLock<HashMap<u64, u64>>,
-    response_lock: Mutex<()>,
+    conversations: ConversationCoordinator,
     tool_activity: Arc<ToolActivityCoordinator>,
     runner: Option<SharedCodeRunner>,
 }
@@ -159,7 +317,7 @@ impl DiscordBot {
             bot_owner_id: AtomicU64::new(0),
             bot_name: RwLock::new(String::new()),
             settings_channel_cache: RwLock::new(HashMap::new()),
-            response_lock: Mutex::new(()),
+            conversations: ConversationCoordinator::default(),
             tool_activity: Arc::new(ToolActivityCoordinator::default()),
             runner,
         }
@@ -376,14 +534,113 @@ impl DiscordBot {
             })
             .await?;
 
-        let _response_guard = self.response_lock.lock().await;
+        if mode == crate::model::ChannelMode::ReadOnly {
+            return Ok(());
+        }
+        let bot_user_id = self.bot_user_id.load(Ordering::Relaxed);
+        let user_mentioned = bot_user_id != 0
+            && message
+                .mentions
+                .iter()
+                .any(|user| user.id.get() == bot_user_id);
+        let invocation_role_id = self
+            .database
+            .invocation_role_id(self.guild_id.get())
+            .await?;
+        let role_mentioned =
+            is_invocation_role_mentioned(invocation_role_id, message.mention_roles.as_slice());
+        let mentioned = user_mentioned || role_mentioned;
+        let direct = bot_user_id != 0
+            && message
+                .referenced_message
+                .as_ref()
+                .is_some_and(|referenced| referenced.author.id.get() == bot_user_id);
+        let ticket = self
+            .conversations
+            .enqueue(PendingConversationMessage {
+                message: message.clone(),
+                channel_name,
+                settings_channel_id,
+                mode,
+                mentioned,
+                direct,
+            })
+            .await;
+        let Some(batch) = self.conversations.claim_after_delay(ticket).await else {
+            return Ok(());
+        };
+        let mut updates = batch.updates.clone();
+        let prepared = tokio::select! {
+            result = self.prepare_conversation_response(context, &batch) => result,
+            changed = updates.changed() => {
+                if changed.is_ok() {
+                    tracing::debug!(
+                        channel_id = batch.channel_id,
+                        generation = batch.generation,
+                        "cancelling conversation response because newer messages arrived"
+                    );
+                }
+                self.conversations.finish(&batch, false).await;
+                return Ok(());
+            }
+        };
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.conversations.finish(&batch, true).await;
+                return Err(error);
+            }
+        };
+        if !self.conversations.is_current(&batch).await {
+            self.conversations.finish(&batch, false).await;
+            return Ok(());
+        }
+        for requested in prepared.action.reactions.iter().take(3) {
+            let Some(reaction) = resolve_reaction(requested, &prepared.custom_emojis) else {
+                tracing::warn!(reaction = %requested, "AI selected an unavailable reaction");
+                continue;
+            };
+            if let Err(error) = prepared.source.react(&context.http, reaction).await {
+                tracing::warn!(?error, "failed to add AI-selected reaction");
+            }
+        }
+        let result = if let Some(answer) = prepared.answer {
+            self.send_answer(
+                context,
+                &prepared.source,
+                prepared.settings_channel_id,
+                &answer,
+            )
+            .await
+        } else {
+            Ok(())
+        };
+        self.conversations.finish(&batch, true).await;
+        result
+    }
+
+    async fn prepare_conversation_response(
+        &self,
+        context: &Context,
+        batch: &ConversationBatch,
+    ) -> Result<PreparedConversationResponse> {
+        let latest = batch
+            .messages
+            .last()
+            .context("conversation batch is empty")?;
+        let source = latest.message.clone();
+        let mode = latest.mode;
+        let channel_name = latest.channel_name.clone();
+        let settings_channel_id = latest.settings_channel_id;
+        let context_limit = u32::try_from(batch.messages.len())
+            .unwrap_or(u32::MAX)
+            .clamp(
+                RECENT_CONTEXT_MESSAGE_LIMIT,
+                MAX_CONVERSATION_BATCH_MESSAGES as u32,
+            );
         let mut current_channel_context = self
             .database
-            .recent_channel_context(
-                self.guild_id.get(),
-                message.channel_id.get(),
-                RECENT_CONTEXT_MESSAGE_LIMIT,
-            )
+            .recent_channel_context(self.guild_id.get(), source.channel_id.get(), context_limit)
             .await?;
 
         for ctx_msg in &mut current_channel_context {
@@ -410,29 +667,18 @@ impl DiscordBot {
             .database
             .recent_active_channels(
                 self.guild_id.get(),
-                message.channel_id.get(),
+                source.channel_id.get(),
                 RECENT_ACTIVE_CHANNEL_LIMIT,
             )
             .await?;
         let bot_user_id = self.bot_user_id.load(Ordering::Relaxed);
-        let user_mentioned = bot_user_id != 0
-            && message
-                .mentions
+        let mentioned = batch.messages.iter().any(|pending| pending.mentioned);
+        let direct = batch.messages.iter().any(|pending| pending.direct);
+        let explicit_request = mentioned
+            || batch
+                .messages
                 .iter()
-                .any(|user| user.id.get() == bot_user_id);
-        let invocation_role_id = self
-            .database
-            .invocation_role_id(self.guild_id.get())
-            .await?;
-        let role_mentioned =
-            is_invocation_role_mentioned(invocation_role_id, message.mention_roles.as_slice());
-        let mentioned = user_mentioned || role_mentioned;
-        let direct = bot_user_id != 0
-            && message
-                .referenced_message
-                .as_ref()
-                .is_some_and(|referenced| referenced.author.id.get() == bot_user_id);
-        let forced_reply = mentioned || (mode == crate::model::ChannelMode::Auto && direct);
+                .any(|pending| pending.mode == crate::model::ChannelMode::Auto && pending.direct);
         let response_mode = if direct {
             ResponseMode::Direct
         } else if mentioned {
@@ -443,7 +689,7 @@ impl DiscordBot {
         let runtime_context = self
             .runtime_context(
                 context,
-                message,
+                &source,
                 response_mode,
                 bot_user_id,
                 channel_name,
@@ -465,27 +711,24 @@ impl DiscordBot {
         let action = decide_action(
             &self.decision_models,
             mode,
-            forced_reply,
+            explicit_request,
             self.intervention_threshold,
             &current_channel_context,
             &runtime_context,
             &emoji_names,
         )
         .await?;
-        for requested in action.reactions.iter().take(3) {
-            let Some(reaction) = resolve_reaction(requested, &custom_emojis) else {
-                tracing::warn!(reaction = %requested, "AI selected an unavailable reaction");
-                continue;
-            };
-            if let Err(error) = message.react(&context.http, reaction).await {
-                tracing::warn!(?error, "failed to add AI-selected reaction");
-            }
-        }
         if !action.should_reply {
-            return Ok(());
+            return Ok(PreparedConversationResponse {
+                source,
+                settings_channel_id,
+                action,
+                custom_emojis,
+                answer: None,
+            });
         }
 
-        let _typing = TypingGuard::start(context, message.channel_id);
+        let _typing = TypingGuard::start(context, source.channel_id);
         let memories = self.database.active_memories(self.guild_id.get()).await?;
         let status_sink =
             ToolStatusSinkGuard::new(context.shard.clone(), Arc::clone(&self.tool_activity));
@@ -495,7 +738,7 @@ impl DiscordBot {
             &runtime_context,
             &memories,
             &self.database,
-            message.id.get(),
+            source.id.get(),
             self.runner.as_deref(),
             Some(&status_sink),
         )
@@ -504,8 +747,13 @@ impl DiscordBot {
             tracing::error!(?error, "answer generation or review exhausted all retries");
             GENERATION_FAILURE_MESSAGE.to_owned()
         });
-        self.send_answer(context, message, settings_channel_id, &answer)
-            .await
+        Ok(PreparedConversationResponse {
+            source,
+            settings_channel_id,
+            action,
+            custom_emojis,
+            answer: Some(answer),
+        })
     }
 
     async fn runtime_context(
@@ -637,6 +885,14 @@ impl DiscordBot {
         }
         Ok(())
     }
+}
+
+fn retain_latest<T>(items: &mut Vec<T>, limit: usize) -> usize {
+    let dropped = items.len().saturating_sub(limit);
+    if dropped > 0 {
+        items.drain(..dropped);
+    }
+    dropped
 }
 
 struct TypingGuard {
@@ -949,5 +1205,26 @@ mod tests {
 
         assert!(!state.finish());
         assert!(state.finish());
+    }
+
+    #[test]
+    fn conversation_state_only_allows_the_latest_generation_to_run() {
+        let mut state = ChannelConversationState::new();
+        let first = state.advance_generation();
+        assert!(state.try_claim(first));
+
+        let second = state.advance_generation();
+        assert!(!state.try_claim(first));
+        assert!(!state.try_claim(second));
+
+        state.release(first);
+        assert!(state.try_claim(second));
+    }
+
+    #[test]
+    fn conversation_batch_retains_only_the_latest_messages() {
+        let mut messages = vec![1, 2, 3, 4];
+        assert_eq!(retain_latest(&mut messages, 3), 1);
+        assert_eq!(messages, vec![2, 3, 4]);
     }
 }

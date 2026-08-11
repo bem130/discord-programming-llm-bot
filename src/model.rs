@@ -140,7 +140,9 @@ impl ChannelMode {
         match self {
             Self::Off => "AIはメッセージを保存せず、返信もしません",
             Self::ReadOnly => "会話をサーバー共通コンテキストへ保存しますが、返信しません",
-            Self::Mention => "会話を保存し、Botへのメンション時だけ返信します",
+            Self::Mention => {
+                "会話を保存し、Botへのメンションには原則返信します（不要時は見送ります）"
+            }
             Self::Auto => "会話を保存し、必要性をAIが判断して返信します",
         }
     }
