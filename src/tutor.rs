@@ -37,6 +37,7 @@ const MAX_TOOL_ARGUMENT_HISTORY_CHARS: usize = 8_000;
 const MAX_TOOL_TRANSCRIPT_CHARS: usize = 64_000;
 const MAX_REPLY_DECISION_ATTEMPTS: usize = 3;
 const EXPLICIT_REPLY_THRESHOLD: f64 = 0.25;
+const HOST_CODE_TOOL_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(not(test))]
 const REPLY_DECISION_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 #[cfg(test)]
@@ -803,6 +804,7 @@ async fn execute_local_tool(
                         .stdin(std::process::Stdio::piped())
                         .stdout(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::piped())
+                        .kill_on_drop(true)
                         .spawn()
                         .context("failed to spawn rustfmt")?;
                     if let Some(mut stdin) = child.stdin.take() {
@@ -812,7 +814,11 @@ async fn execute_local_tool(
                             .await
                             .context("failed to write to rustfmt stdin")?;
                     }
-                    let output = child.wait_with_output().await.context("rustfmt failed")?;
+                    let output =
+                        tokio::time::timeout(HOST_CODE_TOOL_TIMEOUT, child.wait_with_output())
+                            .await
+                            .context("rustfmt timed out")?
+                            .context("rustfmt failed")?;
                     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
                     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
                     Ok(json!({
@@ -822,20 +828,31 @@ async fn execute_local_tool(
                     }))
                 }
                 "python" | "python3" => {
-                    let tmp = std::env::temp_dir().join("format_check.py");
+                    let temp = tempfile::Builder::new()
+                        .prefix("discord-format-check-")
+                        .tempdir()
+                        .context("failed to create isolated temp directory")?;
+                    let tmp = temp.path().join("format_check.py");
                     tokio::fs::write(&tmp, &args.code)
                         .await
                         .context("failed to write temp file")?;
-                    let result = tokio::process::Command::new("python3")
+                    let child = tokio::process::Command::new("python3")
                         .args([
                             "-m",
                             "py_compile",
                             tmp.to_str().unwrap_or("format_check.py"),
                         ])
-                        .output()
-                        .await
-                        .context("failed to run python3 -m py_compile")?;
-                    let _ = tokio::fs::remove_file(&tmp).await;
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .kill_on_drop(true)
+                        .spawn()
+                        .context("failed to spawn python3 -m py_compile")?;
+                    let result =
+                        tokio::time::timeout(HOST_CODE_TOOL_TIMEOUT, child.wait_with_output())
+                            .await
+                            .context("python3 -m py_compile timed out")?
+                            .context("failed to run python3 -m py_compile")?;
                     let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
                     Ok(json!({
                         "ok": result.status.success(),

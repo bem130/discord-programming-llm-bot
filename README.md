@@ -85,6 +85,7 @@ OPENROUTER_MODEL=openai/gpt-5.6-luna
 OPENROUTER_REPLY_DECISION_MODELS=google/gemma-4-26b-a4b-it:free,nvidia/nemotron-3-super-120b-a12b:free,openrouter/free,openai/gpt-5.6-luna
 REPLY_DECISION_THRESHOLD=0.85
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+OPENROUTER_TIMEOUT_SECS=120
 RUST_LOG=discord_learn_programming_bot=info,serenity=warn
 
 CODE_RUNNER_ENABLED=false
@@ -94,6 +95,8 @@ CODE_EXECUTION_TIMEOUT_SECS=20
 ```
 
 `DISCORD_TOKEN`、`DISCORD_GUILD_ID`、`OPENROUTER_API_KEY`、`DATABASE_URL` は必須です。SQLite migrationは起動時に自動適用されます。PostgreSQLは使用しません。
+
+`OPENROUTER_TIMEOUT_SECS` はOpenRouterへの1回のHTTP requestの上限秒数です。既定値は120秒で、5〜300秒へ制限されます。接続確立には別途10秒の上限があります。timeout後は通常のmodel retryへ進み、会話チャンネルを永久に占有しません。
 
 ## Lima VMのセットアップ
 
@@ -146,6 +149,8 @@ VMのsmoke testが完了するまでは `CODE_RUNNER_ENABLED=false` のままに
 `REPLY_DECISION_THRESHOLD` は `0.0` から `1.0` の範囲で設定します。値を上げるほど自発的な介入が減ります。
 
 `reply_decision` へ渡す会話は現在のチャンネルの応答対象バッチです。連続投稿は1.2秒の無通信を目安に集約しますが、投稿が流れ続けても最初の投稿から4秒でバッチを確定します。推論中に補足が届いた場合の破棄・再生成は1回だけ行い、再生成後に届いた投稿は生成を妨げず次のバッチへ残します。これにより新着を取り込みながら、活発なチャンネルでも応答が永久延期されないようにしています。添付本文や画像・PDF本体は判定へ渡さず、メッセージごとの添付数、コード/テキスト添付の有無と行数、その他添付数だけを渡します。通常回答には直近5件、またはそれより多い場合はバッチ全件（最大80件）を渡します。上限超過時はメンションとBotへの返信を優先して保持し、それより古い情報や別チャンネルの本文が必要ならAIが全履歴検索を自発的に利用します。
+
+会話中のDiscordメッセージURLは、設定対象サーバー内かつAIアクセスが`off`ではないチャンネルだけ解決します。別サーバー、DM、許可外チャンネルの本文をBot権限で取得して回答へ混入させません。回答本文中の任意ユーザーメンションは通知せず、Discordの返信先利用者だけを通知対象にします。回答送信はチャンクごとに最大3回再試行し、送信後のSQLite記録失敗によって残りの回答送信を中断しません。
 
 ## AI sessionとprompt送信
 

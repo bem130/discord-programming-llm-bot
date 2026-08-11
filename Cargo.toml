@@ -30,6 +30,7 @@ sqlx = { version = "0.8", default-features = false, features = [
     "sqlite",
 ] }
 thiserror = "2"
+tempfile = "3"
 time = "0.3"
 tokio = { version = "1", features = [
     "io-util",

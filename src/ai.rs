@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 const OPENROUTER_TITLE: &str = "Discord Learn Programming Bot";
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PromptMessage {
@@ -239,10 +241,28 @@ pub struct OpenRouterClient {
 
 impl OpenRouterClient {
     pub fn new(base_url: &str, api_key: String, model: String) -> Result<Self> {
-        Self::with_models(base_url, api_key, vec![model])
+        Self::with_models_and_timeout(base_url, api_key, vec![model], DEFAULT_REQUEST_TIMEOUT)
     }
 
     pub fn with_models(base_url: &str, api_key: String, models: Vec<String>) -> Result<Self> {
+        Self::with_models_and_timeout(base_url, api_key, models, DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    pub fn new_with_timeout(
+        base_url: &str,
+        api_key: String,
+        model: String,
+        request_timeout: Duration,
+    ) -> Result<Self> {
+        Self::with_models_and_timeout(base_url, api_key, vec![model], request_timeout)
+    }
+
+    fn with_models_and_timeout(
+        base_url: &str,
+        api_key: String,
+        models: Vec<String>,
+        request_timeout: Duration,
+    ) -> Result<Self> {
         let mut models = models.into_iter();
         let model = models
             .next()
@@ -256,6 +276,8 @@ impl OpenRouterClient {
         );
         let client = Client::builder()
             .default_headers(headers)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(request_timeout)
             .build()
             .context("failed to build OpenRouter HTTP client")?;
 

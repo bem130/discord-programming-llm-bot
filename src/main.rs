@@ -18,19 +18,22 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env().context("invalid application configuration")?;
     let database = Database::connect(&config.database_url).await?;
-    let model: SharedLanguageModel = Arc::new(OpenRouterClient::new(
+    let openrouter_timeout = Duration::from_secs(config.openrouter_timeout_secs);
+    let model: SharedLanguageModel = Arc::new(OpenRouterClient::new_with_timeout(
         &config.openrouter_base_url,
         config.openrouter_api_key.clone(),
         config.openrouter_model.clone(),
+        openrouter_timeout,
     )?);
     let decision_models: Vec<SharedLanguageModel> = config
         .reply_decision_models
         .iter()
         .map(|model| {
-            OpenRouterClient::new(
+            OpenRouterClient::new_with_timeout(
                 &config.openrouter_base_url,
                 config.openrouter_api_key.clone(),
                 model.clone(),
+                openrouter_timeout,
             )
             .map(|client| Arc::new(client) as SharedLanguageModel)
         })

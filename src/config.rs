@@ -6,6 +6,7 @@ pub const DEFAULT_OPENROUTER_MODEL: &str = "openai/gpt-5.6-luna";
 pub const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_REPLY_DECISION_MODELS: &str = "google/gemma-4-26b-a4b-it:free,nvidia/nemotron-3-super-120b-a12b:free,openrouter/free,openai/gpt-5.6-luna";
 pub const DEFAULT_REPLY_DECISION_THRESHOLD: f64 = 0.85;
+pub const DEFAULT_OPENROUTER_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Clone)]
 pub struct Config {
@@ -16,6 +17,7 @@ pub struct Config {
     pub reply_decision_models: Vec<String>,
     pub reply_decision_threshold: f64,
     pub openrouter_base_url: String,
+    pub openrouter_timeout_secs: u64,
     pub database_url: String,
     pub code_runner_enabled: bool,
     pub lima_instance: String,
@@ -46,6 +48,15 @@ impl Config {
                 .unwrap_or(DEFAULT_REPLY_DECISION_THRESHOLD),
             openrouter_base_url: optional("OPENROUTER_BASE_URL")
                 .unwrap_or_else(|| DEFAULT_OPENROUTER_BASE_URL.to_owned()),
+            openrouter_timeout_secs: optional("OPENROUTER_TIMEOUT_SECS")
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| ConfigError::InvalidInteger("OPENROUTER_TIMEOUT_SECS"))
+                })
+                .transpose()?
+                .unwrap_or(DEFAULT_OPENROUTER_TIMEOUT_SECS)
+                .clamp(5, 300),
             database_url: required("DATABASE_URL")?,
             code_runner_enabled: optional("CODE_RUNNER_ENABLED")
                 .map(|value| parse_bool("CODE_RUNNER_ENABLED", &value))
@@ -138,6 +149,7 @@ mod tests {
         assert_eq!(DEFAULT_OPENROUTER_MODEL, "openai/gpt-5.6-luna");
         assert_eq!(DEFAULT_OPENROUTER_BASE_URL, "https://openrouter.ai/api/v1");
         assert_eq!(DEFAULT_REPLY_DECISION_THRESHOLD, 0.85);
+        assert_eq!(DEFAULT_OPENROUTER_TIMEOUT_SECS, 120);
         assert!(DEFAULT_REPLY_DECISION_MODELS.starts_with("google/gemma-4-26b-a4b-it:free"));
     }
 

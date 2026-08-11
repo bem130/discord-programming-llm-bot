@@ -331,17 +331,24 @@ impl Database {
         Ok(deleted)
     }
 
-    pub async fn get_message_by_discord_id(
+    pub async fn get_allowed_message_by_discord_id(
         &self,
+        guild_id: u64,
         discord_message_id: u64,
     ) -> Result<Option<crate::model::ReferencedMessage>> {
         let row = sqlx::query(
             r#"
-            SELECT discord_message_id, channel_id, author_id, author_name, content, is_bot, created_at
-            FROM messages
-            WHERE discord_message_id = ?
+            SELECT m.discord_message_id, m.channel_id, m.author_id, m.author_name,
+                   m.content, m.is_bot, m.created_at
+            FROM messages AS m
+            INNER JOIN channel_settings AS c
+                ON c.guild_id = m.guild_id
+               AND c.channel_id = COALESCE(m.settings_channel_id, m.channel_id)
+               AND c.mode != 'off'
+            WHERE m.guild_id = ? AND m.discord_message_id = ?
             "#,
         )
+        .bind(guild_id.to_string())
         .bind(discord_message_id.to_string())
         .fetch_optional(&self.pool)
         .await
@@ -1027,6 +1034,60 @@ mod tests {
             ChannelMode::Auto
         );
         assert_eq!(database.channel_settings(1).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn referenced_message_lookup_requires_matching_guild_and_allowed_channel() {
+        let database = test_database().await;
+        database
+            .set_channel_mode(1, 100, ChannelMode::ReadOnly, 99)
+            .await
+            .unwrap();
+        database
+            .record_message(&IncomingMessage {
+                discord_message_id: 1_001,
+                guild_id: 1,
+                channel_id: 100,
+                channel_name: Some("allowed".into()),
+                settings_channel_id: 100,
+                author_id: 7,
+                author_name: "learner".into(),
+                content: "allowed content".into(),
+                is_bot: false,
+                created_at: "2026-08-11T00:00:00Z".into(),
+                referenced_message_id: None,
+                referenced_message: None,
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            database
+                .get_allowed_message_by_discord_id(1, 1_001)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            database
+                .get_allowed_message_by_discord_id(2, 1_001)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        database
+            .set_channel_mode(1, 100, ChannelMode::Off, 99)
+            .await
+            .unwrap();
+        assert!(
+            database
+                .get_allowed_message_by_discord_id(1, 1_001)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

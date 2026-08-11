@@ -44,6 +44,8 @@ const TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
 const CONVERSATION_BATCH_DELAY: Duration = Duration::from_millis(1_200);
 const CONVERSATION_BATCH_MAX_WAIT: Duration = Duration::from_secs(4);
 const MAX_GENERATION_RESTARTS: u8 = 1;
+const DISCORD_SEND_ATTEMPTS: usize = 3;
+const DISCORD_SEND_RETRY_DELAY: Duration = Duration::from_millis(500);
 const GENERATION_FAILURE_MESSAGE: &str = "回答生成またはレビューが一時的に完了しませんでした。少し待ってから、もう一度呼び出してください。";
 
 #[derive(Clone)]
@@ -551,9 +553,9 @@ impl DiscordBot {
             } else if let Some(msg_ref) = &message.message_reference {
                 if let Some(msg_id) = msg_ref.message_id {
                     let chan_id = msg_ref.channel_id.get();
-                    let ref_msg =
-                        resolve_referenced_message(context, &self.database, chan_id, msg_id.get())
-                            .await;
+                    let ref_msg = self
+                        .resolve_referenced_message(context, chan_id, msg_id.get())
+                        .await;
                     (Some(msg_id.get()), Some(ref_msg))
                 } else {
                     (None, None)
@@ -675,7 +677,7 @@ impl DiscordBot {
         } else {
             Ok(())
         };
-        self.conversations.finish(&batch, true).await;
+        self.conversations.finish(&batch, result.is_ok()).await;
         result
     }
 
@@ -705,20 +707,19 @@ impl DiscordBot {
 
         for ctx_msg in &mut current_channel_context {
             let linked_urls = extract_discord_message_urls(&ctx_msg.content);
-            for (linked_chan_id, linked_msg_id) in linked_urls {
+            for (linked_guild_id, linked_chan_id, linked_msg_id) in linked_urls {
                 if ctx_msg.message_id != linked_msg_id
                     && !ctx_msg
                         .linked_messages
                         .iter()
                         .any(|m| m.message_id == linked_msg_id)
                 {
-                    let resolved = resolve_referenced_message(
-                        context,
-                        &self.database,
-                        linked_chan_id,
-                        linked_msg_id,
-                    )
-                    .await;
+                    let resolved = if linked_guild_id == self.guild_id.get() {
+                        self.resolve_referenced_message(context, linked_chan_id, linked_msg_id)
+                            .await
+                    } else {
+                        unavailable_referenced_message(linked_chan_id, linked_msg_id)
+                    };
                     ctx_msg.linked_messages.push(resolved);
                 }
             }
@@ -900,20 +901,49 @@ impl DiscordBot {
         }
 
         for (index, chunk) in chunks.into_iter().enumerate() {
-            let mut builder = CreateMessage::new().content(chunk).allowed_mentions(
-                CreateAllowedMentions::new()
-                    .all_users(true)
-                    .replied_user(true),
-            );
-            if index == 0 {
-                builder = builder.reference_message(source_message);
+            let mut sent = None;
+            let mut last_error = None;
+            for attempt in 1..=DISCORD_SEND_ATTEMPTS {
+                let mut builder = CreateMessage::new()
+                    .content(chunk.clone())
+                    .allowed_mentions(answer_allowed_mentions());
+                if index == 0 {
+                    builder = builder.reference_message(source_message);
+                }
+                match source_message
+                    .channel_id
+                    .send_message(&context.http, builder)
+                    .await
+                {
+                    Ok(message) => {
+                        sent = Some(message);
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            attempt,
+                            max_attempts = DISCORD_SEND_ATTEMPTS,
+                            chunk_index = index,
+                            "failed to send reviewed answer chunk"
+                        );
+                        last_error = Some(error);
+                        if attempt < DISCORD_SEND_ATTEMPTS {
+                            tokio::time::sleep(DISCORD_SEND_RETRY_DELAY).await;
+                        }
+                    }
+                }
             }
-            let sent = source_message
-                .channel_id
-                .send_message(&context.http, builder)
-                .await
-                .context("failed to send reviewed answer")?;
-            self.database
+            let sent = sent.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "failed to send reviewed answer after retries: {}",
+                    last_error
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "unknown Discord error".to_owned())
+                )
+            })?;
+            if let Err(error) = self
+                .database
                 .record_message(&IncomingMessage {
                     discord_message_id: sent.id.get(),
                     guild_id: self.guild_id.get(),
@@ -941,9 +971,68 @@ impl DiscordBot {
                     }),
                     attachments: vec![],
                 })
-                .await?;
+                .await
+            {
+                tracing::error!(
+                    ?error,
+                    message_id = sent.id.get(),
+                    "Discord answer was sent but could not be recorded"
+                );
+            }
         }
         Ok(())
+    }
+
+    async fn resolve_referenced_message(
+        &self,
+        context: &Context,
+        channel_id: u64,
+        message_id: u64,
+    ) -> crate::model::ReferencedMessage {
+        if let Ok(Some(cached)) = self
+            .database
+            .get_allowed_message_by_discord_id(self.guild_id.get(), message_id)
+            .await
+            && cached.channel_id == channel_id
+        {
+            return cached;
+        }
+
+        let requested_channel = ChannelId::new(channel_id);
+        let settings_channel_id = match configuration_channel_id(context, requested_channel).await {
+            Ok(channel_id) => channel_id,
+            Err(_) => return unavailable_referenced_message(channel_id, message_id),
+        };
+        let allowed = self
+            .database
+            .channel_mode(self.guild_id.get(), settings_channel_id.get())
+            .await
+            .is_ok_and(crate::model::ChannelMode::stores_messages);
+        if !allowed {
+            return unavailable_referenced_message(channel_id, message_id);
+        }
+
+        match context
+            .http
+            .get_message(requested_channel, MessageId::new(message_id))
+            .await
+        {
+            Ok(message)
+                if message.guild_id == Some(self.guild_id)
+                    && message.channel_id == requested_channel =>
+            {
+                crate::model::ReferencedMessage {
+                    message_id: message.id.get(),
+                    channel_id: message.channel_id.get(),
+                    author_id: message.author.id.get(),
+                    author_name: message.author.global_name.unwrap_or(message.author.name),
+                    content: message.content,
+                    is_bot: message.author.bot,
+                    created_at: message.timestamp.to_string(),
+                }
+            }
+            _ => unavailable_referenced_message(channel_id, message_id),
+        }
     }
 }
 
@@ -968,6 +1057,10 @@ fn conversation_batch_ready_at(first: Instant, latest: Instant) -> Instant {
         latest + CONVERSATION_BATCH_DELAY,
         first + CONVERSATION_BATCH_MAX_WAIT,
     )
+}
+
+fn answer_allowed_mentions() -> CreateAllowedMentions {
+    CreateAllowedMentions::new().replied_user(true)
 }
 
 struct TypingGuard {
@@ -1163,62 +1256,43 @@ fn is_text_attachment(attachment: &Attachment) -> bool {
             })
 }
 
-fn extract_discord_message_urls(content: &str) -> Vec<(u64, u64)> {
+fn extract_discord_message_urls(content: &str) -> Vec<(u64, u64, u64)> {
     let mut results = Vec::new();
     let re = match regex::Regex::new(
-        r"https://(?:ptb\.|canary\.)?discord\.com/channels/(?:@me|\d+)/(\d+)/(\d+)",
+        r"https://(?:ptb\.|canary\.)?discord\.com/channels/(\d+)/(\d+)/(\d+)",
     ) {
         Ok(re) => re,
         Err(_) => return results,
     };
     for captures in re.captures_iter(content) {
-        if let (Some(channel_mat), Some(message_mat)) = (captures.get(1), captures.get(2))
-            && let (Ok(channel_id), Ok(message_id)) = (
+        if let (Some(guild_mat), Some(channel_mat), Some(message_mat)) =
+            (captures.get(1), captures.get(2), captures.get(3))
+            && let (Ok(guild_id), Ok(channel_id), Ok(message_id)) = (
+                guild_mat.as_str().parse::<u64>(),
                 channel_mat.as_str().parse::<u64>(),
                 message_mat.as_str().parse::<u64>(),
             )
-            && !results.contains(&(channel_id, message_id))
+            && !results.contains(&(guild_id, channel_id, message_id))
         {
-            results.push((channel_id, message_id));
+            results.push((guild_id, channel_id, message_id));
         }
     }
     results.truncate(5);
     results
 }
 
-async fn resolve_referenced_message(
-    context: &Context,
-    database: &Database,
+fn unavailable_referenced_message(
     channel_id: u64,
     message_id: u64,
 ) -> crate::model::ReferencedMessage {
-    if let Ok(Some(cached)) = database.get_message_by_discord_id(message_id).await {
-        return cached;
-    }
-
-    match context
-        .http
-        .get_message(ChannelId::new(channel_id), MessageId::new(message_id))
-        .await
-    {
-        Ok(disc_msg) => crate::model::ReferencedMessage {
-            message_id: disc_msg.id.get(),
-            channel_id: disc_msg.channel_id.get(),
-            author_id: disc_msg.author.id.get(),
-            author_name: disc_msg.author.global_name.unwrap_or(disc_msg.author.name),
-            content: disc_msg.content,
-            is_bot: disc_msg.author.bot,
-            created_at: disc_msg.timestamp.to_string(),
-        },
-        Err(_) => crate::model::ReferencedMessage {
-            message_id,
-            channel_id,
-            author_id: 0,
-            author_name: "Unknown".to_owned(),
-            content: "[メッセージを取得できませんでした]".to_owned(),
-            is_bot: false,
-            created_at: String::new(),
-        },
+    crate::model::ReferencedMessage {
+        message_id,
+        channel_id,
+        author_id: 0,
+        author_name: "Unknown".to_owned(),
+        content: "[メッセージを取得できないか、AIアクセスが許可されていません]".to_owned(),
+        is_bot: false,
+        created_at: String::new(),
     }
 }
 
@@ -1237,6 +1311,15 @@ mod tests {
     #[test]
     fn rejects_unknown_shortcode() {
         assert!(resolve_reaction(":not_a_real_emoji:", &[]).is_none());
+    }
+
+    #[test]
+    fn answers_only_notify_the_replied_user() {
+        let allowed = serde_json::to_value(answer_allowed_mentions()).unwrap();
+        assert_eq!(allowed["parse"], serde_json::json!([]));
+        assert_eq!(allowed["users"], serde_json::json!([]));
+        assert_eq!(allowed["roles"], serde_json::json!([]));
+        assert_eq!(allowed["replied_user"], true);
     }
 
     #[test]
@@ -1267,9 +1350,9 @@ mod tests {
 
     #[test]
     fn extracts_discord_message_urls() {
-        let content = "これを見て: https://discord.com/channels/12345/67890/999888777 あとこれも https://ptb.discord.com/channels/@me/111/222";
+        let content = "これを見て: https://discord.com/channels/12345/67890/999888777 あとこれはDMなので対象外 https://ptb.discord.com/channels/@me/111/222";
         let extracted = extract_discord_message_urls(content);
-        assert_eq!(extracted, vec![(67890, 999888777), (111, 222)]);
+        assert_eq!(extracted, vec![(12345, 67890, 999888777)]);
     }
 
     #[test]
