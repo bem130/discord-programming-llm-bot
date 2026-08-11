@@ -22,6 +22,7 @@ use serenity::{
 use tokio::{
     sync::{Mutex, Notify, oneshot, watch},
     task::JoinHandle,
+    time::Instant,
 };
 
 use crate::{
@@ -41,11 +42,14 @@ const MAX_TEXT_ATTACHMENT_BYTES: u32 = 512 * 1024;
 const MAX_MULTIMODAL_ATTACHMENT_BYTES: u32 = 20 * 1024 * 1024;
 const TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
 const CONVERSATION_BATCH_DELAY: Duration = Duration::from_millis(1_200);
+const CONVERSATION_BATCH_MAX_WAIT: Duration = Duration::from_secs(4);
+const MAX_GENERATION_RESTARTS: u8 = 1;
 const GENERATION_FAILURE_MESSAGE: &str = "回答生成またはレビューが一時的に完了しませんでした。少し待ってから、もう一度呼び出してください。";
 
 #[derive(Clone)]
 struct PendingConversationMessage {
     message: Message,
+    enqueued_at: Instant,
     channel_name: Option<String>,
     settings_channel_id: ChannelId,
     mode: crate::model::ChannelMode,
@@ -58,6 +62,7 @@ struct ConversationBatch {
     generation: u64,
     messages: Vec<PendingConversationMessage>,
     updates: watch::Receiver<u64>,
+    may_restart: bool,
 }
 
 struct ConversationTicket {
@@ -78,6 +83,8 @@ struct ChannelConversationState {
     generation: u64,
     active_generation: Option<u64>,
     pending: Vec<PendingConversationMessage>,
+    batch_started_at: Instant,
+    generation_restarts: u8,
     updates: watch::Sender<u64>,
     availability: Arc<Notify>,
 }
@@ -89,6 +96,8 @@ impl ChannelConversationState {
             generation: 0,
             active_generation: None,
             pending: vec![],
+            batch_started_at: Instant::now(),
+            generation_restarts: 0,
             updates,
             availability: Arc::new(Notify::new()),
         }
@@ -115,6 +124,10 @@ impl ChannelConversationState {
             self.availability.notify_waiters();
         }
     }
+
+    fn may_restart(&self) -> bool {
+        self.generation_restarts < MAX_GENERATION_RESTARTS
+    }
 }
 
 #[derive(Default)]
@@ -129,8 +142,18 @@ impl ConversationCoordinator {
         let state = channels
             .entry(channel_id)
             .or_insert_with(ChannelConversationState::new);
+        if state.pending.is_empty() {
+            state.batch_started_at = pending.enqueued_at;
+        }
         state.pending.push(pending);
-        let dropped = retain_latest(&mut state.pending, MAX_CONVERSATION_BATCH_MESSAGES);
+        let dropped = retain_latest_prioritizing(
+            &mut state.pending,
+            MAX_CONVERSATION_BATCH_MESSAGES,
+            |pending| {
+                pending.mentioned
+                    || (pending.mode == crate::model::ChannelMode::Auto && pending.direct)
+            },
+        );
         if dropped > 0 {
             tracing::warn!(
                 channel_id,
@@ -147,7 +170,16 @@ impl ConversationCoordinator {
     }
 
     async fn claim_after_delay(&self, ticket: ConversationTicket) -> Option<ConversationBatch> {
-        tokio::time::sleep(CONVERSATION_BATCH_DELAY).await;
+        let ready_at = {
+            let channels = self.channels.lock().await;
+            let state = channels.get(&ticket.channel_id)?;
+            if state.generation != ticket.generation {
+                return None;
+            }
+            let latest = state.pending.last()?.enqueued_at;
+            conversation_batch_ready_at(state.batch_started_at, latest)
+        };
+        tokio::time::sleep_until(ready_at).await;
         loop {
             let availability = {
                 let mut channels = self.channels.lock().await;
@@ -161,6 +193,7 @@ impl ConversationCoordinator {
                         generation: ticket.generation,
                         messages: state.pending.clone(),
                         updates: ticket.updates,
+                        may_restart: state.may_restart(),
                     });
                 }
                 Arc::clone(&state.availability).notified_owned()
@@ -169,12 +202,26 @@ impl ConversationCoordinator {
         }
     }
 
-    async fn is_current(&self, batch: &ConversationBatch) -> bool {
+    async fn can_commit(&self, batch: &ConversationBatch) -> bool {
         self.channels
             .lock()
             .await
             .get(&batch.channel_id)
-            .is_some_and(|state| state.generation == batch.generation)
+            .is_some_and(|state| {
+                state.active_generation == Some(batch.generation)
+                    && (!batch.may_restart || state.generation == batch.generation)
+            })
+    }
+
+    async fn restart(&self, batch: &ConversationBatch) {
+        let mut channels = self.channels.lock().await;
+        let Some(state) = channels.get_mut(&batch.channel_id) else {
+            return;
+        };
+        if state.active_generation == Some(batch.generation) {
+            state.generation_restarts = state.generation_restarts.saturating_add(1);
+        }
+        state.release(batch.generation);
     }
 
     async fn finish(&self, batch: &ConversationBatch, covered: bool) {
@@ -192,6 +239,10 @@ impl ConversationCoordinator {
             state
                 .pending
                 .retain(|pending| !covered_ids.contains(&pending.message.id.get()));
+            state.generation_restarts = 0;
+            if let Some(first) = state.pending.first() {
+                state.batch_started_at = first.enqueued_at;
+            }
         }
         if state.pending.is_empty() && state.active_generation.is_none() {
             channels.remove(&batch.channel_id);
@@ -559,6 +610,7 @@ impl DiscordBot {
             .conversations
             .enqueue(PendingConversationMessage {
                 message: message.clone(),
+                enqueued_at: Instant::now(),
                 channel_name,
                 settings_channel_id,
                 mode,
@@ -569,20 +621,24 @@ impl DiscordBot {
         let Some(batch) = self.conversations.claim_after_delay(ticket).await else {
             return Ok(());
         };
-        let mut updates = batch.updates.clone();
-        let prepared = tokio::select! {
-            result = self.prepare_conversation_response(context, &batch) => result,
-            changed = updates.changed() => {
-                if changed.is_ok() {
-                    tracing::debug!(
-                        channel_id = batch.channel_id,
-                        generation = batch.generation,
-                        "cancelling conversation response because newer messages arrived"
-                    );
+        let prepared = if batch.may_restart {
+            let mut updates = batch.updates.clone();
+            tokio::select! {
+                result = self.prepare_conversation_response(context, &batch) => result,
+                changed = updates.changed() => {
+                    if changed.is_ok() {
+                        tracing::debug!(
+                            channel_id = batch.channel_id,
+                            generation = batch.generation,
+                            "restarting conversation response once to include newer messages"
+                        );
+                    }
+                    self.conversations.restart(&batch).await;
+                    return Ok(());
                 }
-                self.conversations.finish(&batch, false).await;
-                return Ok(());
             }
+        } else {
+            self.prepare_conversation_response(context, &batch).await
         };
         let prepared = match prepared {
             Ok(prepared) => prepared,
@@ -591,8 +647,12 @@ impl DiscordBot {
                 return Err(error);
             }
         };
-        if !self.conversations.is_current(&batch).await {
-            self.conversations.finish(&batch, false).await;
+        if !self.conversations.can_commit(&batch).await {
+            if batch.may_restart {
+                self.conversations.restart(&batch).await;
+            } else {
+                self.conversations.finish(&batch, false).await;
+            }
             return Ok(());
         }
         for requested in prepared.action.reactions.iter().take(3) {
@@ -887,12 +947,27 @@ impl DiscordBot {
     }
 }
 
-fn retain_latest<T>(items: &mut Vec<T>, limit: usize) -> usize {
+fn retain_latest_prioritizing<T>(
+    items: &mut Vec<T>,
+    limit: usize,
+    is_priority: impl Fn(&T) -> bool,
+) -> usize {
     let dropped = items.len().saturating_sub(limit);
-    if dropped > 0 {
-        items.drain(..dropped);
+    for _ in 0..dropped {
+        let index = items
+            .iter()
+            .position(|item| !is_priority(item))
+            .unwrap_or(0);
+        items.remove(index);
     }
     dropped
+}
+
+fn conversation_batch_ready_at(first: Instant, latest: Instant) -> Instant {
+    std::cmp::min(
+        latest + CONVERSATION_BATCH_DELAY,
+        first + CONVERSATION_BATCH_MAX_WAIT,
+    )
 }
 
 struct TypingGuard {
@@ -1219,12 +1294,35 @@ mod tests {
 
         state.release(first);
         assert!(state.try_claim(second));
+
+        state.generation_restarts = MAX_GENERATION_RESTARTS;
+        assert!(!state.may_restart());
     }
 
     #[test]
     fn conversation_batch_retains_only_the_latest_messages() {
         let mut messages = vec![1, 2, 3, 4];
-        assert_eq!(retain_latest(&mut messages, 3), 1);
+        assert_eq!(retain_latest_prioritizing(&mut messages, 3, |_| false), 1);
         assert_eq!(messages, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn conversation_batch_retains_priority_messages_when_bounded() {
+        let mut messages = vec![(1, true), (2, false), (3, false), (4, false)];
+        assert_eq!(
+            retain_latest_prioritizing(&mut messages, 3, |(_, priority)| *priority),
+            1
+        );
+        assert_eq!(messages, vec![(1, true), (3, false), (4, false)]);
+    }
+
+    #[test]
+    fn conversation_batch_hard_deadline_does_not_slide_with_new_messages() {
+        let first = Instant::now();
+        let latest = first + CONVERSATION_BATCH_MAX_WAIT;
+        assert_eq!(
+            conversation_batch_ready_at(first, latest),
+            first + CONVERSATION_BATCH_MAX_WAIT
+        );
     }
 }
