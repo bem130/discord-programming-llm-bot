@@ -1,6 +1,7 @@
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -23,12 +24,24 @@ use crate::{
 const REPLY_DECISION_PROMPT: &str = include_str!("../prompt/reply_decision.md");
 const MEMORY_REVIEW_PROMPT: &str = include_str!("../prompt/memory_review.md");
 const ANSWER_MAX_TOKENS: u32 = 8_000;
-const MAX_LOCAL_TOOL_ROUNDS: usize = 4;
+// Local tool rounds are bounded so an indecisive model cannot run up an unbounded bill.
+// Once the limit is reached the loop switches to a wrap-up request that asks the model to
+// answer from the information gathered so far, so this is a soft cap rather than a hard
+// failure. Duplicate tool calls (same name + arguments) are also reported to the model to
+// discourage retrying the same read over and over.
+// 20 rounds accommodate search/memory lookups plus repeated compile-verify-fix-retry
+// cycles, which the code execution tool legitimately needs.
+const MAX_LOCAL_TOOL_ROUNDS: usize = 20;
 const MAX_REPLY_DECISION_ATTEMPTS: usize = 3;
 #[cfg(not(test))]
 const REPLY_DECISION_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 #[cfg(test)]
 const REPLY_DECISION_RETRY_BASE_DELAY: Duration = Duration::ZERO;
+
+pub trait ToolStatusSink: Send + Sync {
+    fn tool_started(&self, tool_name: &str);
+    fn idle(&self);
+}
 
 pub async fn decide_action(
     models: &[SharedLanguageModel],
@@ -165,6 +178,7 @@ pub struct BotAction {
     pub reactions: Vec<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn generate_reviewed_answer(
     model: &dyn LanguageModel,
     context: &[ContextMessage],
@@ -173,6 +187,7 @@ pub async fn generate_reviewed_answer(
     database: &Database,
     source_message_id: u64,
     runner: Option<&dyn CodeRunner>,
+    status_sink: Option<&dyn ToolStatusSink>,
 ) -> Result<String> {
     let mut messages = conversation_prompt(context, runtime_context, memories);
     let generated = generate_with_tools(
@@ -183,14 +198,19 @@ pub async fn generate_reviewed_answer(
         context,
         &mut messages,
         runner,
+        status_sink,
     )
     .await
     .context("answer generation failed")?;
+    if let Some(sink) = status_sink {
+        sink.idle();
+    }
     review_response(model, runtime_context.server.id, &messages, generated)
         .await
         .context("generated answer did not pass review")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn generate_with_tools(
     model: &dyn LanguageModel,
     database: &Database,
@@ -199,13 +219,19 @@ async fn generate_with_tools(
     context: &[ContextMessage],
     messages: &mut Vec<PromptMessage>,
     runner: Option<&dyn CodeRunner>,
+    status_sink: Option<&dyn ToolStatusSink>,
 ) -> Result<String> {
-    for _round in 0..MAX_LOCAL_TOOL_ROUNDS {
+    let mut tool_rounds: Vec<String> = Vec::new();
+    let mut seen_calls: HashSet<(String, String)> = HashSet::new();
+    for round in 0..MAX_LOCAL_TOOL_ROUNDS {
         let mut request = ModelRequest::text_with_web_search(messages.clone(), ANSWER_MAX_TOKENS)
             .with_tool(conversation_search_tool())
             .with_tool(memory_details_tool())
             .with_tool(memory_candidate_tool())
             .with_tool(channel_recent_messages_tool())
+            .with_tool(channel_message_range_tool())
+            .with_tool(messages_newer_than_message_tool())
+            .with_tool(messages_newer_than_datetime_tool())
             .with_tool(explain_compiler_error_tool())
             .with_tool(format_and_lint_code_tool())
             .with_guild_session(runtime_context.server.id, AiSessionPurpose::Conversation);
@@ -224,11 +250,42 @@ async fn generate_with_tools(
             "model requested too many local tools in one round"
         );
 
+        let tool_names: Vec<_> = response
+            .tool_calls
+            .iter()
+            .map(|tool_call| tool_call.function.name.clone())
+            .collect();
+        tracing::info!(
+            round,
+            tool_calls = ?tool_names,
+            "model requested local tools during answer generation"
+        );
+        tool_rounds.push(tool_names.join(" | "));
+
+        let duplicate_calls: Vec<String> = response
+            .tool_calls
+            .iter()
+            .filter(|tool_call| {
+                if tool_call.function.name == "execute_code_in_sandbox" {
+                    return false;
+                }
+                !seen_calls.insert((
+                    tool_call.function.name.clone(),
+                    tool_call.function.arguments.clone(),
+                ))
+            })
+            .map(|tool_call| tool_call.function.name.clone())
+            .collect();
+
         messages.push(PromptMessage::assistant_tool_calls(
             response.content,
             response.tool_calls.clone(),
         ));
         for tool_call in response.tool_calls {
+            let tool_name = tool_call.function.name.clone();
+            if let Some(sink) = status_sink {
+                sink.tool_started(&tool_name);
+            }
             let result = execute_local_tool(
                 model,
                 database,
@@ -241,17 +298,83 @@ async fn generate_with_tools(
             )
             .await;
             let content = match result {
-                Ok(value) => value.to_string(),
-                Err(error) => json!({
-                    "ok": false,
-                    "error": error.to_string()
-                })
-                .to_string(),
+                Ok(value) => {
+                    tracing::info!(
+                        tool = %tool_name,
+                        "local tool executed"
+                    );
+                    value.to_string()
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        tool = %tool_name,
+                        error = %error,
+                        "local tool failed"
+                    );
+                    json!({
+                        "ok": false,
+                        "error": error.to_string()
+                    })
+                    .to_string()
+                }
             };
             messages.push(PromptMessage::tool_result(tool_call.id, content));
         }
+
+        if !duplicate_calls.is_empty() {
+            tracing::warn!(
+                tool = %duplicate_calls.join(", "),
+                "model repeated identical local tool calls"
+            );
+            messages.push(PromptMessage::system(format!(
+                "警告: 前のラウンドで同じツール・同じ引数がすでに呼ばれています: {}. 同じ結果しか得られないため、引数を変えるか別のツールを使うか、これまでに得た情報で回答をまとめてください。",
+                duplicate_calls.join(", ")
+            )));
+        }
     }
-    Err(anyhow!("model exceeded the local tool iteration limit"))
+
+    tracing::warn!(
+        rounds = tool_rounds.join(" | "),
+        "local tool round limit reached; falling back to a wrap-up answer"
+    );
+    let mut wrap_up_messages = messages.clone();
+    wrap_up_messages.push(PromptMessage::user(
+        "ローカルツールの追加呼び出しは上限に達したため打ち切りました。\
+         これまでに得たツール結果と現在の会話を基に、ベストな回答をまとめてください。\
+         未確認・未検証の事項は「未確認」「未検証」と明記してください。\
+         追加でローカルツールは呼ばずに回答を返してください。",
+    ));
+    for _ in 0..2 {
+        let request =
+            ModelRequest::text_with_web_search(wrap_up_messages.clone(), ANSWER_MAX_TOKENS)
+                .with_guild_session(runtime_context.server.id, AiSessionPurpose::Conversation);
+        let response =
+            complete_response_with_retry(model, request, "answer_generation_wrap_up").await?;
+        if response.tool_calls.is_empty() {
+            return response
+                .content
+                .filter(|content| !content.trim().is_empty())
+                .context("model returned neither content nor tool calls during wrap-up");
+        }
+        wrap_up_messages.push(PromptMessage::assistant_tool_calls(
+            response.content,
+            response.tool_calls.clone(),
+        ));
+        for tool_call in response.tool_calls {
+            wrap_up_messages.push(PromptMessage::tool_result(
+                tool_call.id,
+                json!({
+                    "ok": false,
+                    "error": "ローカルツールは上限到達後は利用できません。得られた情報で回答をまとめてください。"
+                })
+                .to_string(),
+            ));
+        }
+    }
+    Err(anyhow!(
+        "model did not produce content after the local tool round limit and wrap-up attempts; tool calls per round: {}",
+        tool_rounds.join(" | ")
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -269,13 +392,20 @@ async fn execute_local_tool(
         "search_conversation_history" => {
             let args: ConversationSearchArguments =
                 serde_json::from_str(arguments).context("invalid conversation search arguments")?;
+            let channel_id = match args.channel_id {
+                Some(id) => Some(
+                    resolve_channel_id(database, runtime_context.server.id, Some(id), None, id)
+                        .await?,
+                ),
+                None => None,
+            };
             let results = database
                 .search_messages(
                     runtime_context.server.id,
                     runtime_context.channel.id,
                     &args.pattern,
                     args.regex,
-                    args.channel_id,
+                    channel_id,
                     args.author_id,
                     args.include_bot_messages,
                     args.limit.unwrap_or(10),
@@ -355,18 +485,18 @@ async fn execute_local_tool(
             }
             let args: ChannelRecentArgs = serde_json::from_str(arguments)
                 .context("invalid get_channel_recent_messages arguments")?;
-            let channel_id = match args.channel_id {
-                Some(id) => id,
-                None => {
-                    let name = args
-                        .channel_name
-                        .context("either channel_id or channel_name is required")?;
-                    database
-                        .find_channel_id_by_name(runtime_context.server.id, &name)
-                        .await?
-                        .with_context(|| format!("channel not found: {name}"))?
-                }
-            };
+            anyhow::ensure!(
+                args.channel_id.is_some() || args.channel_name.is_some(),
+                "either channel_id or channel_name is required"
+            );
+            let channel_id = resolve_channel_id(
+                database,
+                runtime_context.server.id,
+                args.channel_id,
+                args.channel_name.as_deref(),
+                runtime_context.channel.id,
+            )
+            .await?;
             let limit = args.limit.unwrap_or(10).clamp(1, 20);
             let messages = database
                 .recent_channel_context(runtime_context.server.id, channel_id, limit)
@@ -375,17 +505,148 @@ async fn execute_local_tool(
                 "ok": true,
                 "channel_id": channel_id,
                 "count": messages.len(),
-                "messages": messages.iter().map(|m| json!({
-                    "message_id": m.message_id,
-                    "author_id": m.author_id,
-                    "author_name": m.author_name,
-                    "content": m.content,
-                    "is_bot": m.is_bot,
-                    "created_at": m.created_at,
-                    "reply_to": m.reply_to,
-                    "linked_messages": m.linked_messages,
-                    "attachment_count": m.attachments.len()
-                })).collect::<Vec<_>>()
+                "order": "ascending",
+                "messages": context_messages_to_json(&messages)
+            }))
+        }
+        "get_channel_message_range" => {
+            #[derive(Deserialize)]
+            struct ChannelRangeArgs {
+                channel_id: Option<u64>,
+                channel_name: Option<String>,
+                start_offset: u32,
+                end_offset: u32,
+            }
+            let args: ChannelRangeArgs = serde_json::from_str(arguments)
+                .context("invalid get_channel_message_range arguments")?;
+            anyhow::ensure!(
+                args.start_offset >= 1,
+                "start_offset must be at least 1 (1 = most recent message)"
+            );
+            anyhow::ensure!(
+                args.end_offset >= args.start_offset,
+                "end_offset must be greater than or equal to start_offset"
+            );
+            anyhow::ensure!(args.end_offset <= 80, "end_offset must be at most 80");
+            let channel_id = resolve_channel_id(
+                database,
+                runtime_context.server.id,
+                args.channel_id,
+                args.channel_name.as_deref(),
+                runtime_context.channel.id,
+            )
+            .await?;
+            let messages = database
+                .recent_channel_context(runtime_context.server.id, channel_id, args.end_offset)
+                .await?;
+            let window: Vec<ContextMessage> = messages
+                .into_iter()
+                .skip((args.start_offset - 1) as usize)
+                .collect();
+            Ok(json!({
+                "ok": true,
+                "channel_id": channel_id,
+                "start_offset": args.start_offset,
+                "end_offset": args.end_offset,
+                "count": window.len(),
+                "order": "ascending",
+                "messages": context_messages_to_json(&window)
+            }))
+        }
+        "get_messages_newer_than_message" => {
+            #[derive(Deserialize)]
+            struct NewerThanMessageArgs {
+                channel_id: Option<u64>,
+                channel_name: Option<String>,
+                message_id: Option<u64>,
+                message_url: Option<String>,
+                limit: Option<u32>,
+            }
+            let args: NewerThanMessageArgs = serde_json::from_str(arguments)
+                .context("invalid get_messages_newer_than_message arguments")?;
+            let (url_channel_id, url_message_id) = match &args.message_url {
+                Some(url) => message_url_parts(url).with_context(|| {
+                    format!("message URL must end with a numeric channel/message id: {url}")
+                })?,
+                None => (None, None),
+            };
+            let after_message_id = match args.message_id {
+                Some(id) => id,
+                None => url_message_id.context("either message_id or message_url is required")?,
+            };
+            let channel_id = match url_channel_id {
+                Some(id) => id,
+                None => {
+                    resolve_channel_id(
+                        database,
+                        runtime_context.server.id,
+                        args.channel_id,
+                        args.channel_name.as_deref(),
+                        runtime_context.channel.id,
+                    )
+                    .await?
+                }
+            };
+            let limit = args.limit.unwrap_or(80).clamp(1, 80);
+            let messages = database
+                .messages_newer_than_message(
+                    runtime_context.server.id,
+                    channel_id,
+                    after_message_id,
+                    limit + 1,
+                )
+                .await?;
+            let (messages, has_more) = take_page(messages, limit);
+            Ok(json!({
+                "ok": true,
+                "channel_id": channel_id,
+                "after_message_id": after_message_id,
+                "count": messages.len(),
+                "order": "ascending",
+                "has_more": has_more,
+                "messages": context_messages_to_json(&messages)
+            }))
+        }
+        "get_messages_newer_than_datetime" => {
+            #[derive(Deserialize)]
+            struct NewerThanDatetimeArgs {
+                channel_id: Option<u64>,
+                channel_name: Option<String>,
+                datetime: String,
+                after_message_id: Option<u64>,
+                limit: Option<u32>,
+            }
+            let args: NewerThanDatetimeArgs = serde_json::from_str(arguments)
+                .context("invalid get_messages_newer_than_datetime arguments")?;
+            let datetime = normalize_datetime_to_utc(&args.datetime)?;
+            let channel_id = resolve_channel_id(
+                database,
+                runtime_context.server.id,
+                args.channel_id,
+                args.channel_name.as_deref(),
+                runtime_context.channel.id,
+            )
+            .await?;
+            let limit = args.limit.unwrap_or(80).clamp(1, 80);
+            let messages = database
+                .messages_newer_than_datetime(
+                    runtime_context.server.id,
+                    channel_id,
+                    &datetime,
+                    args.after_message_id,
+                    limit + 1,
+                )
+                .await?;
+            let (messages, has_more) = take_page(messages, limit);
+            Ok(json!({
+                "ok": true,
+                "channel_id": channel_id,
+                "after_datetime": datetime,
+                "after_message_id": args.after_message_id,
+                "count": messages.len(),
+                "order": "ascending",
+                "has_more": has_more,
+                "messages": context_messages_to_json(&messages)
             }))
         }
         "explain_compiler_error" => {
@@ -645,7 +906,7 @@ fn code_execution_tool() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "execute_code_in_sandbox",
-            "description": "隔離されたLima VM環境でコードをコンパイル・実行する。コードの動作検証、コンパイルエラー確認、標準出力の取得が必要な場合に使用する。対応言語: Rust, Python, C/C++, Go, JavaScript (node), TypeScript (ts-node/tsc), Haskell (ghc), OCaml, Lean 4 (lean/lake; ~/.elan/env を source すること), Coq, Elm 0.19.1, Common Lisp (sbcl), Lazy-K (lazyk) 等。",
+            "description": "隔離されたLima VM環境でコードをコンパイル・実行する。コードの動作検証、コンパイルエラー確認、標準出力の取得が必要な場合に使用する。対応言語: Rust, Python, C/C++, Go, JavaScript (node), TypeScript (ts-node/tsc), Haskell (ghc), OCaml, Lean 4 (lean/lake), Coq, Elm 0.19.1, Common Lisp (sbcl), Lazy-K (lazyk) 等。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -687,7 +948,7 @@ fn channel_recent_messages_tool() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "get_channel_recent_messages",
-            "description": "指定したDiscordチャンネルの直近メッセージを取得する。別チャンネルの最新の議論状況や文脈確認が必要な場合に使用する。channel_idまたはchannel_nameのいずれかを指定すること。",
+            "description": "指定したDiscordチャンネルの直近メッセージを古い順（時系列順）で取得する。返却されるmessages配列は常に古い順で並ぶ（先頭が最も古い）。別チャンネルの最新の議論状況や文脈確認が必要な場合に使用する。channel_idまたはchannel_nameのいずれかを指定すること。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -695,6 +956,216 @@ fn channel_recent_messages_tool() -> serde_json::Value {
                     "channel_name": { "type": "string", "description": "チャンネル名（例: 'questions', 'pair-programming'）。channel_idが不明な場合に使用" },
                     "limit": { "type": "integer", "description": "取得するメッセージ件数（1〜20、デフォルト10）" }
                 },
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn channel_message_range_tool() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "get_channel_message_range",
+            "description": "指定したDiscordチャンネル（省略時は現在のチャンネル）の過去メッセージを、最新を1とした1始まりの順位で取得する。start_offset=1は最新メッセージ、start_offset=5&end_offset=10なら5番目に新しい〜10番目に新しいメッセージを返す。返却されるmessages配列は常に古い順（時系列順）で並ぶ（先頭が最も古い）。数メッセージ前のやり取りや、現在のpromptに含まれない少し前の文脈を確認したい場合に使用する。このツールで取得できるのは最新80件の範囲のみ（end_offsetの上限は80）。それより古い文脈はget_messages_newer_than_datetime（datetimeに日時を指定）やsearch_conversation_historyを使用すること。channel_idまたはchannel_nameのいずれかを指定できる。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_id": { "type": "integer", "description": "取得するDiscordチャンネルID（数値）" },
+                    "channel_name": { "type": "string", "description": "チャンネル名（例: 'questions', 'pair-programming'）。channel_idが不明な場合に使用" },
+                    "start_offset": { "type": "integer", "minimum": 1, "description": "取得開始位置（最新メッセージを1とする1始まりの順位）" },
+                    "end_offset": { "type": "integer", "minimum": 1, "maximum": 80, "description": "取得終了位置（start_offset以上）" }
+                },
+                "required": ["start_offset", "end_offset"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn context_messages_to_json(messages: &[ContextMessage]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|m| {
+            json!({
+                "message_id": m.message_id,
+                "author_id": m.author_id,
+                "author_name": m.author_name,
+                "content": m.content,
+                "is_bot": m.is_bot,
+                "created_at": m.created_at,
+                "reply_to": m.reply_to,
+                "linked_messages": m.linked_messages,
+                "attachment_count": m.attachments.len()
+            })
+        })
+        .collect()
+}
+
+fn take_page<T>(messages: Vec<T>, limit: u32) -> (Vec<T>, bool) {
+    let has_more = messages.len() > limit as usize;
+    (
+        messages.into_iter().take(limit as usize).collect(),
+        has_more,
+    )
+}
+
+static DATETIME_PATTERN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+
+fn is_valid_datetime(value: &str) -> bool {
+    let re = DATETIME_PATTERN.get_or_init(|| {
+        Regex::new(
+            r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?$",
+        )
+        .expect("valid datetime regex")
+    });
+    re.is_match(value)
+}
+
+static DATETIME_TZ_PATTERN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+static DATETIME_COMPACT_OFFSET_PATTERN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+
+fn has_explicit_timezone(value: &str) -> bool {
+    if value.ends_with('Z') {
+        return true;
+    }
+    DATETIME_TZ_PATTERN
+        .get_or_init(|| Regex::new(r"[+-]\d{2}:?\d{2}$").expect("valid timezone suffix regex"))
+        .is_match(value)
+}
+
+async fn resolve_channel_id(
+    database: &Database,
+    server_id: u64,
+    channel_id: Option<u64>,
+    channel_name: Option<&str>,
+    fallback: u64,
+) -> Result<u64> {
+    if let Some(name) = channel_name.map(str::trim).filter(|name| !name.is_empty()) {
+        let resolved = database
+            .find_channel_id_by_name(server_id, name)
+            .await?
+            .with_context(|| format!("channel not found: {name}"))?;
+        if let Some(id) = channel_id.filter(|id| *id != resolved) {
+            tracing::warn!(
+                channel_id = id,
+                resolved,
+                "channel_id does not match channel_name; using channel_name"
+            );
+        }
+        return Ok(resolved);
+    }
+    if let Some(id) = channel_id {
+        if database.channel_exists(server_id, id).await? {
+            return Ok(id);
+        }
+        if id.to_string().len() >= 6
+            && let Some(matched) = database.find_channel_id_by_prefix(server_id, id).await?
+        {
+            tracing::warn!(
+                given_channel_id = id,
+                resolved = matched,
+                "channel_id not found exactly; matched it by prefix"
+            );
+            return Ok(matched);
+        }
+        anyhow::bail!(
+            "channel_id {id} does not uniquely match a channel of this server (it may have been \
+             transcribed incorrectly). Use channel_name instead, or rely on the current channel."
+        );
+    }
+    Ok(fallback)
+}
+
+fn message_url_parts(url: &str) -> Option<(Option<u64>, Option<u64>)> {
+    let mut parts = url.trim().trim_end_matches('/').rsplit('/');
+    let message_id = parts.next().and_then(|part| part.parse().ok());
+    let channel_id = parts.next().and_then(|part| part.parse().ok());
+    if message_id.is_none() && channel_id.is_none() {
+        None
+    } else {
+        Some((channel_id, message_id))
+    }
+}
+
+fn normalize_datetime_to_utc(value: &str) -> Result<String> {
+    let value = value.trim();
+    anyhow::ensure!(
+        is_valid_datetime(value),
+        "datetime must look like '2026-08-10T12:00:00Z', '2026-08-10T23:00:00+09:00', \
+         '2026-08-10T23:00:00+0900' or '2026-08-10 23:00:00' (timezone omitted = UTC)"
+    );
+
+    let normalized = if !has_explicit_timezone(value) {
+        let with_t = value.replace(' ', "T");
+        let has_seconds = with_t
+            .rsplit_once('T')
+            .is_some_and(|(_, rest)| rest.matches(':').count() >= 2);
+        if has_seconds {
+            format!("{with_t}Z")
+        } else {
+            format!("{with_t}:00Z")
+        }
+    } else if let Some(captures) = DATETIME_COMPACT_OFFSET_PATTERN
+        .get_or_init(|| Regex::new(r"([+-]\d{2})(\d{2})$").expect("valid compact offset regex"))
+        .captures(value)
+    {
+        let offset = captures.get(0).expect("offset match");
+        format!(
+            "{}{}:{}",
+            &value[..offset.start()],
+            captures.get(1).expect("sign and hours").as_str(),
+            captures.get(2).expect("minutes").as_str()
+        )
+    } else {
+        value.to_owned()
+    };
+
+    let rfc3339 = time::format_description::well_known::Rfc3339;
+    let utc = time::OffsetDateTime::parse(&normalized, &rfc3339)
+        .with_context(|| format!("invalid datetime: {value}"))?
+        .to_offset(time::UtcOffset::UTC);
+    utc.format(&rfc3339)
+        .context("failed to format normalized datetime")
+}
+
+fn messages_newer_than_message_tool() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "get_messages_newer_than_message",
+            "description": "指定したDiscordメッセージ（message_idまたはmessage_url）より後に送信された、指定チャンネルのメッセージを古い順（時系列順、ascending）で最大limit件取得する。途中参加や、直前に読んだメッセージより後の続きをまとめて確認する場合に使用する。返却されるmessages配列は常に古い順で並ぶ。has_more=trueの場合はまだ続きがあるので、返却された最後のメッセージのmessage_idをmessage_idに指定して再呼び出しすると続きを取得できる。search_conversation_historyの結果に含まれるDiscordメッセージURLや、get_channel_recent_messages/get_channel_message_rangeのmessage_idを基準に指定できる。message_urlを渡した場合はそのURLに含まれるチャンネルを自動的に使用するので、channel_id/channel_nameは省略してよい。指定メッセージ自身は結果に含まれない。利用者が「このメッセージ以降」と言う場合、それがリプライ先のメッセージや貼られたメッセージURLを指すことが多いので、リプライ先・URLのメッセージを基準（after_message_id）にすること。結果が0件でも「会話がない」とは判断せず、基準メッセージより前の文脈をget_channel_message_range/get_channel_recent_messages/search_conversation_historyで読んでから回答すること。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_id": { "type": "integer", "description": "取得するDiscordチャンネルID（数値）" },
+                    "channel_name": { "type": "string", "description": "チャンネル名（例: 'questions', 'pair-programming'）。channel_idが不明な場合に使用" },
+                    "message_id": { "type": "integer", "description": "基準となるDiscordメッセージID（数値）" },
+                    "message_url": { "type": "string", "description": "基準となるDiscordメッセージのURL（例: https://discord.com/channels/123/456/789）。message_idが不明な場合に使用" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 80, "description": "取得する最大件数（デフォルト80）" }
+                },
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn messages_newer_than_datetime_tool() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "get_messages_newer_than_datetime",
+            "description": "指定した日付時刻（datetime）より後に送信された、指定チャンネル（省略時は現在のチャンネル）のメッセージを古い順（時系列順、ascending）で最大limit件取得する。例: datetime='2026-08-10T12:00:00Z'。フォーマット: YYYY-MM-DDとHH:MM[:SS[.fff]]をTまたは半角空白で区切り、末尾にZまたは+09:00（+0900でも可）等のタイムゾーンを付けられる。タイムゾーンを省略した場合はUTCとして解釈する。日本時間を指定する場合は+09:00を付けること（例: 日本時間2026年8月9日23時は '2026-08-09T23:00:00+09:00'）。返却されるmessages配列は常に古い順で並ぶ。has_more=trueの場合はまだ続きがあるので、返却された最後のメッセージのcreated_atとmessage_idを、それぞれdatetimeとafter_message_idに指定して再呼び出しすると続きを取得できる。同じ時刻のメッセージも取りこぼさないため、両方を指定すること。「この日時以降の全メッセージを要約して」等の依頼では、has_more=falseになるまで続けて全件取得すること。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_id": { "type": "integer", "description": "取得するDiscordチャンネルID（数値）" },
+                    "channel_name": { "type": "string", "description": "チャンネル名（例: 'questions', 'pair-programming'）。channel_idが不明な場合に使用" },
+                    "datetime": { "type": "string", "description": "基準となる日付時刻（この日時より後に送信されたメッセージを取得）" },
+                    "after_message_id": { "type": "integer", "description": "ページング用。同じcreated_atの続きから取得する場合、直前ページの最後のmessage_idを指定する" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 80, "description": "取得する最大件数（デフォルト80）" }
+                },
+                "required": ["datetime"],
                 "additionalProperties": false
             }
         }
@@ -858,6 +1329,68 @@ mod tests {
         vec![std::sync::Arc::new(StubModel {
             responses: Mutex::new(VecDeque::new()),
         })]
+    }
+
+    #[tokio::test]
+    async fn tool_loop_exhaustion_still_returns_a_final_answer() {
+        use crate::ai::{ModelResponse, ToolCall, ToolFunction};
+
+        struct QueuedResponseModel {
+            responses: Mutex<VecDeque<ModelResponse>>,
+        }
+
+        #[async_trait]
+        impl LanguageModel for QueuedResponseModel {
+            async fn complete(&self, _request: ModelRequest) -> Result<String> {
+                Ok("unused".into())
+            }
+
+            async fn complete_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
+                self.responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .ok_or_else(|| anyhow!("unexpected model call"))
+            }
+        }
+
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let mut responses = VecDeque::new();
+        for round in 0..MAX_LOCAL_TOOL_ROUNDS {
+            responses.push_back(ModelResponse {
+                content: Some("checking message history...".into()),
+                tool_calls: vec![ToolCall {
+                    id: format!("call_read_{round}"),
+                    kind: "function".into(),
+                    function: ToolFunction {
+                        name: "get_messages_newer_than_datetime".into(),
+                        arguments: r#"{"datetime":"2026-08-09T23:00:00+09:00"}"#.into(),
+                    },
+                }],
+            });
+        }
+        responses.push_back(ModelResponse {
+            content: Some("final answer".into()),
+            tool_calls: vec![],
+        });
+        let model = QueuedResponseModel {
+            responses: Mutex::new(responses),
+        };
+
+        let mut messages = vec![PromptMessage::user("hello")];
+        let answer = generate_with_tools(
+            &model,
+            &database,
+            &runtime_context(),
+            0,
+            &[],
+            &mut messages,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer, "final answer");
     }
 
     #[tokio::test]
@@ -1046,6 +1579,7 @@ mod tests {
                 is_current_channel: true,
                 last_message_at: "2026-08-09T00:00:00Z".into(),
             }],
+            now: "2026-08-10T00:00:00.000Z".into(),
         }
     }
 
@@ -1164,5 +1698,155 @@ mod tests {
         };
 
         assert!(validate_memory_candidate(&candidate).is_err());
+    }
+
+    #[test]
+    fn normalize_datetime_converts_all_supported_formats_to_utc() {
+        let cases = [
+            ("2026-08-09T23:00:00+09:00", "2026-08-09T14:00:00Z"),
+            ("2026-08-09T23:00:00+0900", "2026-08-09T14:00:00Z"),
+            ("2026-08-09 23:00:00", "2026-08-09T23:00:00Z"),
+            ("2026-08-09T23:00", "2026-08-09T23:00:00Z"),
+            ("2026-08-09T14:00:00Z", "2026-08-09T14:00:00Z"),
+            ("2026-08-10T02:00:00+09:00", "2026-08-09T17:00:00Z"),
+            ("2026-08-09T23:30:00+09:00", "2026-08-09T14:30:00Z"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                normalize_datetime_to_utc(input).unwrap(),
+                expected,
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_datetime_rejects_malformed_input() {
+        for input in [
+            "",
+            "2026-08-09",
+            "not a datetime",
+            "2026-13-01T00:00:00+09:00",
+        ] {
+            assert!(
+                normalize_datetime_to_utc(input).is_err(),
+                "expected error for input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn take_page_only_reports_more_when_an_extra_row_exists() {
+        let (page, has_more) = take_page(vec![1, 2], 2);
+        assert_eq!(page, vec![1, 2]);
+        assert!(!has_more);
+
+        let (page, has_more) = take_page(vec![1, 2, 3], 2);
+        assert_eq!(page, vec![1, 2]);
+        assert!(has_more);
+    }
+
+    #[test]
+    fn message_url_parts_extracts_channel_and_message_ids() {
+        let url = "https://discord.com/channels/1535219312229490688/1535816143409909812/1536012339546165268";
+        let (channel, message) = message_url_parts(url).unwrap();
+        assert_eq!(channel, Some(1535816143409909812));
+        assert_eq!(message, Some(1536012339546165268));
+
+        let (channel, message) = message_url_parts(url).unwrap();
+        assert_eq!(channel, Some(1535816143409909812));
+        assert_eq!(message, Some(1536012339546165268));
+
+        let (channel, message) = message_url_parts("https://discord.com/channels/1535219312229490688/1535816143409909812/1536012339546165268/").unwrap();
+        assert_eq!(channel, Some(1535816143409909812));
+        assert_eq!(message, Some(1536012339546165268));
+
+        assert!(message_url_parts("not a url").is_none());
+        assert!(message_url_parts("https://discord.com/channels/abc/def/ghi").is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_channel_id_prefers_name_and_rejects_unknown_ids() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let learn_programming_id: u64 = 1535816143409909812;
+        database
+            .record_message(&crate::model::IncomingMessage {
+                discord_message_id: 1,
+                guild_id: 1,
+                channel_id: learn_programming_id,
+                channel_name: Some("learn_programming".into()),
+                settings_channel_id: learn_programming_id,
+                author_id: 2,
+                author_name: "tester".into(),
+                content: "hello".into(),
+                is_bot: false,
+                created_at: "2026-08-09T00:00:00Z".into(),
+                referenced_message_id: None,
+                referenced_message: None,
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+
+        let resolved = resolve_channel_id(
+            &database,
+            1,
+            Some(153581614340990),
+            Some("learn_programming"),
+            99,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, learn_programming_id);
+
+        let resolved = resolve_channel_id(&database, 1, Some(learn_programming_id), None, 99)
+            .await
+            .unwrap();
+        assert_eq!(resolved, learn_programming_id);
+
+        let resolved = resolve_channel_id(&database, 1, None, None, 99)
+            .await
+            .unwrap();
+        assert_eq!(resolved, 99);
+
+        let err = resolve_channel_id(&database, 1, None, Some("nope"), 99)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("channel not found"));
+    }
+
+    #[tokio::test]
+    async fn resolve_channel_id_matches_truncated_id_by_prefix() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let learn_programming_id: u64 = 1535816143409909812;
+        database
+            .record_message(&crate::model::IncomingMessage {
+                discord_message_id: 1,
+                guild_id: 1,
+                channel_id: learn_programming_id,
+                channel_name: Some("learn_programming".into()),
+                settings_channel_id: learn_programming_id,
+                author_id: 2,
+                author_name: "tester".into(),
+                content: "hello".into(),
+                is_bot: false,
+                created_at: "2026-08-09T00:00:00Z".into(),
+                referenced_message_id: None,
+                referenced_message: None,
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+
+        let truncated = 153581614340990;
+        let resolved = resolve_channel_id(&database, 1, Some(truncated), None, 99)
+            .await
+            .unwrap();
+        assert_eq!(resolved, learn_programming_id);
+
+        let err = resolve_channel_id(&database, 1, Some(999999999999999), None, 99)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not uniquely match"));
     }
 }

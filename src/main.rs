@@ -9,11 +9,12 @@ use discord_learn_programming_bot::{
     runner::{LimaRunner, SharedCodeRunner},
 };
 use serenity::{Client, all::GuildId};
+use tracing_subscriber::prelude::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    init_tracing();
+    let _log_guard = init_tracing()?;
 
     let config = Config::from_env().context("invalid application configuration")?;
     let database = Database::connect(&config.database_url).await?;
@@ -61,12 +62,31 @@ async fn main() -> anyhow::Result<()> {
     client.start().await.context("Discord client stopped")
 }
 
-fn init_tracing() {
+fn init_tracing() -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "discord_learn_programming_bot=info,serenity=warn".into());
+    let file_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "discord_learn_programming_bot=debug,serenity=warn".into());
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
+    std::fs::create_dir_all("data/logs").context("failed to create log directory")?;
+    let (file_writer, guard) =
+        tracing_appender::non_blocking(tracing_appender::rolling::daily("data/logs", "bot.log"));
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(std::io::stdout),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(file_writer)
+                .with_filter(file_filter),
+        )
         .init();
+
+    Ok(guard)
 }

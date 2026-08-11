@@ -17,6 +17,7 @@ use serenity::{
         MessageUpdateEvent, ReactionType, Ready, RoleId,
     },
     async_trait,
+    gateway::{ActivityData, ShardMessenger},
 };
 use tokio::{
     sync::{Mutex, oneshot},
@@ -30,7 +31,7 @@ use crate::{
     delivery::split_message,
     model::{IncomingAttachment, IncomingMessage, RecentChannelActivity},
     runner::SharedCodeRunner,
-    tutor::{decide_action, generate_reviewed_answer},
+    tutor::{ToolStatusSink, decide_action, generate_reviewed_answer},
 };
 
 const RECENT_CONTEXT_MESSAGE_LIMIT: u32 = 5;
@@ -39,6 +40,34 @@ const MAX_TEXT_ATTACHMENT_BYTES: u32 = 512 * 1024;
 const MAX_MULTIMODAL_ATTACHMENT_BYTES: u32 = 20 * 1024 * 1024;
 const TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
 const GENERATION_FAILURE_MESSAGE: &str = "回答生成またはレビューが一時的に完了しませんでした。少し待ってから、もう一度呼び出してください。";
+
+struct ToolStatusSinkGuard {
+    shard: ShardMessenger,
+}
+
+impl ToolStatusSinkGuard {
+    fn new(shard: ShardMessenger) -> Self {
+        Self { shard }
+    }
+}
+
+impl ToolStatusSink for ToolStatusSinkGuard {
+    fn tool_started(&self, tool_name: &str) {
+        self.shard.set_activity(Some(ActivityData::custom(format!(
+            "ツール実行中: {tool_name}"
+        ))));
+    }
+
+    fn idle(&self) {
+        self.shard.set_activity(None);
+    }
+}
+
+impl Drop for ToolStatusSinkGuard {
+    fn drop(&mut self) {
+        self.shard.set_activity(None);
+    }
+}
 
 pub struct DiscordBot {
     guild_id: GuildId,
@@ -400,6 +429,7 @@ impl DiscordBot {
 
         let _typing = TypingGuard::start(context, message.channel_id);
         let memories = self.database.active_memories(self.guild_id.get()).await?;
+        let status_sink = ToolStatusSinkGuard::new(context.shard.clone());
         let answer = generate_reviewed_answer(
             self.model.as_ref(),
             &current_channel_context,
@@ -408,6 +438,7 @@ impl DiscordBot {
             &self.database,
             message.id.get(),
             self.runner.as_deref(),
+            Some(&status_sink),
         )
         .await
         .unwrap_or_else(|error| {
@@ -464,6 +495,7 @@ impl DiscordBot {
                     .unwrap_or_else(|| message.author.name.clone()),
             },
             recent_active_channels,
+            now: crate::context::now_iso_string(),
         }
     }
 

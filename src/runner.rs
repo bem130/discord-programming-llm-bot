@@ -299,7 +299,7 @@ fn build_guest_script(plan: &ExecutionPlan, execution_timeout: Duration) -> Resu
     ));
     script.push_str("cd /\nsudo -n chown -R nobody:nogroup \"$workdir\"\nset +e\n");
     script.push_str(&format!(
-        "sudo -n systemd-run --quiet --wait --pipe --collect \\\n  --uid=nobody \\\n  --working-directory=\"$workdir\" \\\n  --setenv=\"HOME=$workdir\" \\\n  --setenv='PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \\\n  --setenv='LANG=C.UTF-8' \\\n  --property=NoNewPrivileges=yes \\\n  --property=MemoryMax={GUEST_MEMORY_LIMIT_MIB}M \\\n  --property=MemorySwapMax=0 \\\n  --property=CPUQuota=150% \\\n  --property=TasksMax={GUEST_TASK_LIMIT} \\\n  --property=KillMode=control-group \\\n  --property=RuntimeMaxSec={}s \\\n  --property=PrivateTmp=yes \\\n  --property=PrivateDevices=yes \\\n  --property=ProtectSystem=strict \\\n  --property=ProtectHome=yes \\\n  --property=\"ReadWritePaths=$workdir\" \\\n  --property=ProtectKernelTunables=yes \\\n  --property=ProtectKernelModules=yes \\\n  --property=ProtectControlGroups=yes \\\n  --property=ProtectHostname=yes \\\n  --property=RestrictSUIDSGID=yes \\\n  --property=RestrictRealtime=yes \\\n  --property=LockPersonality=yes \\\n  /bin/bash \"$workdir/.discord-wrapper.sh\"\nstatus=$?\nexit \"$status\"\n",
+        "sudo -n systemd-run --quiet --wait --pipe --collect \\\n  --uid=nobody \\\n  --working-directory=\"$workdir\" \\\n  --setenv=\"HOME=$workdir\" \\\n  --setenv='PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \\\n  --setenv='LANG=C.UTF-8' \\\n  --setenv='RUSTUP_HOME=/usr/local/rustup' \\\n  --setenv='CARGO_HOME=/usr/local/cargo' \\\n  --setenv='ELAN_HOME=/usr/local/elan' \\\n  --property=NoNewPrivileges=yes \\\n  --property=MemoryMax={GUEST_MEMORY_LIMIT_MIB}M \\\n  --property=MemorySwapMax=0 \\\n  --property=CPUQuota=150% \\\n  --property=TasksMax={GUEST_TASK_LIMIT} \\\n  --property=KillMode=control-group \\\n  --property=RuntimeMaxSec={}s \\\n  --property=PrivateTmp=yes \\\n  --property=PrivateDevices=yes \\\n  --property=ProtectSystem=strict \\\n  --property=ProtectHome=yes \\\n  --property=\"ReadWritePaths=$workdir\" \\\n  --property=ProtectKernelTunables=yes \\\n  --property=ProtectKernelModules=yes \\\n  --property=ProtectControlGroups=yes \\\n  --property=ProtectHostname=yes \\\n  --property=RestrictSUIDSGID=yes \\\n  --property=RestrictRealtime=yes \\\n  --property=LockPersonality=yes \\\n  /bin/bash \"$workdir/.discord-wrapper.sh\"\nstatus=$?\nexit \"$status\"\n",
         execution_timeout.as_secs().saturating_add(5)
     ));
     Ok(script)
@@ -340,6 +340,9 @@ mod tests {
         assert!(script.contains("--uid=nobody"));
         assert!(script.contains("ProtectSystem=strict"));
         assert!(script.contains("MemoryMax=1536M"));
+        assert!(script.contains("RUSTUP_HOME=/usr/local/rustup"));
+        assert!(script.contains("CARGO_HOME=/usr/local/cargo"));
+        assert!(script.contains("ELAN_HOME=/usr/local/elan"));
         assert!(!script.contains("+  --"));
     }
 

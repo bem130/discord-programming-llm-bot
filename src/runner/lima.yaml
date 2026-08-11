@@ -114,4 +114,11 @@ provision:
       ln -sf /usr/local/elan/bin/lean  /usr/local/bin/lean
       ln -sf /usr/local/elan/bin/lake  /usr/local/bin/lake
       ln -sf /usr/local/elan/bin/elan  /usr/local/bin/elan
+      # Make elan world-readable (used by the nobody sandbox user)
+      chmod -R a+rX /usr/local/elan
+      # Expose lean/lake/elan on PATH for all users
+      cat > /etc/profile.d/elan.sh << 'ELANEOF'
+      export ELAN_HOME=/usr/local/elan
+      export PATH=/usr/local/elan/bin:$PATH
+      ELANEOF
       /usr/local/bin/lean --version

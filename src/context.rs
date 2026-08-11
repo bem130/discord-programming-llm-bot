@@ -30,6 +30,7 @@ pub struct RuntimeContext {
     pub channel: RuntimeLocation,
     pub current_user: RuntimeUser,
     pub recent_active_channels: Vec<RecentChannelActivity>,
+    pub now: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,6 +54,12 @@ pub struct RuntimeUser {
 
 fn is_slice_empty<T>(slice: &[T]) -> bool {
     slice.is_empty()
+}
+
+pub fn now_iso_string() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("failed to format current datetime")
 }
 
 #[derive(Serialize)]
@@ -370,6 +377,7 @@ mod tests {
                 is_current_channel: true,
                 last_message_at: "2026-08-09T00:00:00Z".into(),
             }],
+            now: "2026-08-10T00:00:00.000Z".into(),
         };
 
         let messages = conversation_prompt(&[], &runtime, &[]);

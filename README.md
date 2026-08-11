@@ -141,7 +141,7 @@ VMのsmoke testが完了するまでは `CODE_RUNNER_ENABLED=false` のままに
 
 `OPENROUTER_REPLY_DECISION_MODELS` はアプリケーションが左から順に試すmodel IDです。既定値は、無料かつstructured outputs対応の `google/gemma-4-26b-a4b-it:free`、`nvidia/nemotron-3-super-120b-a12b:free`、利用可能な無料modelを選ぶ `openrouter/free`、最後に通常回答と同じLunaです。HTTPエラーだけでなく、不正JSONや空応答でも次のmodelへ進みます。JSON要求にはOpenRouterのResponse Healingも使用します。`inclusionai/ling-3.0-tiny:free` は2026-08-09時点の公式model一覧ではstructured outputs非対応のため、既定の判定modelからは外しています。
 
-最後のLunaまで到達すると有料推論になるため、完全無料に限定する場合は末尾のLunaを削除できます。その場合、全無料modelが失敗した自動介入は安全側に倒して発言しません。明示メンションは判定失敗時にも返信対象となり、回答生成・レビューまで全再試行に失敗した場合は固定の障害案内を返信します。
+最後のLunaまで到達すると有料推論になるため、完全無料に限定する場合は末尾のLunaを削除できます。その場合、全無料modelが失敗した自動介入は安全側に倒して発言しません。明示メンションは判定失敗時にも返信対象となります。回答生成自体またはレビュー呼び出し自体が全再試行に失敗した場合は固定の障害案内を返信します。レビューが不承認のまま修正上限に達した場合は、意味レビューで最も高く評価された候補を送信します。静的検査の修正上限に達した場合は、broadcast mentionの除去とコードフェンス閉鎖を行ったbest-effort候補を送信します。
 
 `REPLY_DECISION_THRESHOLD` は `0.0` から `1.0` の範囲で設定します。値を上げるほど自発的な介入が減ります。
 
@@ -160,7 +160,7 @@ sessionはDiscordチャンネルでは分割しません。`Guild ID × AI処理
 - メモリ候補審査: `memory_review.md`、runtime context、現在のチャンネルの直近5件のテキスト、既存メモリ索引、候補
 - 回答レビュー・修正: `review.md` または固定の編集promptと、通常回答に使ったruntime context・直近5件を含む元request、候補回答
 
-runtime contextには、現在地に加えて最近アクティブな許可チャンネルを最大12件含めます。一覧は保存メッセージの到着順から機械的に計算し、チャンネルID・最新の保存名・現在のチャンネルか・最終発言日時だけを持ちます。別チャンネルの本文は一覧へ含めず、必要な場合だけ会話検索を使います。
+runtime contextには、現在地に加えて最近アクティブな許可チャンネルを最大12件、そして現在の日時（UTC、`now` フィールド）を含めます。一覧は保存メッセージの到着順から機械的に計算し、チャンネルID・最新の保存名・現在のチャンネルか・最終発言日時だけを持ちます。別チャンネルの本文は一覧へ含めず、必要な場合だけ会話検索を使います。日時（`now`）はメッセージの `created_at` と同じUTC表現で、AIがタイムゾーンや「今日」の解釈に使います。
 
 ## 起動
 
@@ -213,6 +213,9 @@ Discordのtyping表示は10秒で失効するため、Botは回答処理中に8�
 - `propose_guild_memory`: 明示的な依頼がなくても、長期的なプロジェクト判断・教訓・一次資料を検出して保存を提案
 - `execute_code_in_sandbox`: 隔離されたLima VM環境でコード（Rust, Python, C/C++, Go, JavaScript, TypeScript, Haskell, OCaml, Lean 4, Coq, Elm, Common Lisp, Lazy-K等）のコンパイル・検証・標準出力取得を実行
 - `get_channel_recent_messages`: 指定したDiscordチャンネルの直近メッセージをタイムライン順に取得。channel_idまたはchannel_nameで指定し、別チャンネルの文脈把握に利用
+- `get_channel_message_range`: 指定したチャンネル（省略時は現在のチャンネル）の過去メッセージを、最新を1とした1始まりの順位範囲（start_offset〜end_offset）で取得
+- `get_messages_newer_than_message`: 指定したメッセージIDまたはメッセージURLより後に送信されたメッセージを新しい順に取得。続きの確認や途中参加に利用
+- `get_messages_newer_than_datetime`: 指定した日付時刻より後に送信されたメッセージを新しい順に取得。前回確認以降の新着把握に利用。タイムゾーン省略はUTC扱い、日本時間（JST=UTC+9）で指定する場合は末尾に `+09:00` を付ける（例: `2026-08-09T23:00:00+09:00`）。ページング時は直前結果の `created_at` と `message_id` をそれぞれ `datetime` と `after_message_id` に渡す
 - `explain_compiler_error`: `rustc --explain`を使ってRustエラーコード（E0382等）の公式解説をローカルで取得
 - `format_and_lint_code`: `rustfmt`（Rust）または`python -m py_compile`（Python）をホスト上で直接実行し、整形・構文チェック結果をVMなしで即返す
 
@@ -255,7 +258,7 @@ Discordで本文や添付が編集されると保存内容を置換し、本文�
   -> メモリ提案があれば独立AI審査後に自動保存
   -> Markdown表・LaTeX・未閉鎖code fence・broadcast mentionの静的検査
   -> 元のpromptと会話に基づくAIレビュー
-  -> 不承認なら最大2回修正
+  -> 不承認なら最大2回修正し、なお不承認なら最高スコア候補を送信
   -> Rust側で分割してDiscordへ送信
 ```
 

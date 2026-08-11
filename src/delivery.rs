@@ -65,23 +65,32 @@ fn split_raw(content: &str, max_utf16_units: usize) -> Vec<String> {
     while start < characters.len() {
         let mut hard_end = start;
         let mut utf16_units = 0;
+        let mut last_newline = None;
         while hard_end < characters.len() {
             let character_units = characters[hard_end].len_utf16();
             if utf16_units + character_units > max_utf16_units {
                 break;
             }
+            if characters[hard_end] == '\n' {
+                last_newline = Some(hard_end);
+            }
             utf16_units += character_units;
             hard_end += 1;
         }
-        let end = if hard_end == characters.len() {
-            hard_end
-        } else {
-            (start..hard_end)
-                .rev()
-                .find(|index| matches!(characters[*index], '\n' | ' '))
-                .filter(|index| *index > start)
-                .map_or(hard_end, |index| index + 1)
-        };
+        if hard_end == characters.len() {
+            chunks.push(characters[start..].iter().collect());
+            break;
+        }
+        let end = last_newline.filter(|index| *index > start).map_or_else(
+            || {
+                (start..hard_end)
+                    .rev()
+                    .find(|index| characters[*index] == ' ')
+                    .filter(|index| *index > start)
+                    .map_or(hard_end, |index| index + 1)
+            },
+            |index| index + 1,
+        );
         chunks.push(characters[start..end].iter().collect());
         start = end;
     }
@@ -161,6 +170,40 @@ mod tests {
             chunks
                 .iter()
                 .all(|chunk| chunk.matches("```").count().is_multiple_of(2))
+        );
+    }
+
+    #[test]
+    fn code_block_language_is_preserved_across_boundaries() {
+        let content = format!("```python\n{}\n```", "print('x')\n".repeat(400));
+        let chunks = split_message(&content);
+        assert!(chunks.len() > 2);
+        for chunk in &chunks {
+            assert!(chunk.starts_with("```python\n"));
+            assert!(chunk.ends_with("```"));
+            assert!(chunk.matches("```").count().is_multiple_of(2));
+            assert!(chunk.encode_utf16().count() <= DISCORD_MESSAGE_LIMIT);
+        }
+    }
+
+    #[test]
+    fn splits_prefer_newline_boundaries() {
+        let content = format!("{}\n{}", "a".repeat(1_500), "b".repeat(400));
+        let chunks = split_message(&content);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], format!("{}\n", "a".repeat(1_500)));
+        assert_eq!(chunks[1], "b".repeat(400));
+    }
+
+    #[test]
+    fn chunks_never_exceed_discord_limit_even_inside_code_block() {
+        let content = format!("```rust\n{}\n```", "let x = 1; // comment\n".repeat(200));
+        let chunks = split_message(&content);
+        assert!(chunks.len() > 1);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.encode_utf16().count() <= DISCORD_MESSAGE_LIMIT)
         );
     }
 

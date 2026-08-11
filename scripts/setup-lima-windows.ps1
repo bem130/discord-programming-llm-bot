@@ -144,7 +144,12 @@ if (-not $isWindows) {
     throw 'This script only supports Windows hosts.'
 }
 
-$architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+$rawArch = $env:PROCESSOR_ARCHITECTURE
+if ($rawArch -eq "AMD64") {
+    $architecture = "X64"
+} else {
+    $architecture = $rawArch
+}
 if (-not $limaAssets.ContainsKey($architecture)) {
     throw "Unsupported Windows architecture: $architecture"
 }
@@ -264,9 +269,20 @@ if (-not $SkipVmStart) {
 
     & $limaExecutable --tty=false shell $InstanceName bash -lc `
         'set -euo pipefail
+         export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo ELAN_HOME=/usr/local/elan
+         export PATH=/usr/local/cargo/bin:/usr/local/elan/bin:$PATH
          rustc --version
          cargo --version
+         printf "fn main(){println!(\"rust-ok\");}\n" > /tmp/discord-smoke.rs
+         rustc /tmp/discord-smoke.rs -o /tmp/discord-smoke-rs
+         test "$(/tmp/discord-smoke-rs)" = rust-ok
+         rm -f /tmp/discord-smoke.rs /tmp/discord-smoke-rs
          gcc --version | head -n 1
+         echo ''#include <stdio.h>'' > /tmp/discord-smoke.c
+         echo ''int main(void){printf("%d\n",2+3);return 0;}'' >> /tmp/discord-smoke.c
+         gcc /tmp/discord-smoke.c -o /tmp/discord-smoke-c
+         test "$(/tmp/discord-smoke-c)" = 5
+         rm -f /tmp/discord-smoke.c /tmp/discord-smoke-c
          python3 --version
          go version
          node --version
@@ -274,12 +290,15 @@ if (-not $SkipVmStart) {
          ts-node --version
          ghc --version | head -n 1
          ocaml --version
-         coq --version | head -n 1
+         coqc --version | head -n 1
          sbcl --version | head -n 1
          elm --version
-         lazyk --version 2>&1 || (lazyk 2>&1; true)
+         lazyk </dev/null 2>&1 || true
          lean --version
-         lake --version'
+         lake --version
+         echo ''#eval IO.println "lean-ok"'' > /tmp/discord-smoke.lean
+         lean /tmp/discord-smoke.lean
+         rm -f /tmp/discord-smoke.lean'
     if ($LASTEXITCODE -ne 0) {
         throw "The Lima instance failed its toolchain smoke test: $InstanceName"
     }

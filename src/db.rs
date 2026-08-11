@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use regex::RegexBuilder;
 use sqlx::{
     Row, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow},
 };
 
 use crate::model::{
@@ -13,6 +13,7 @@ use crate::model::{
 };
 
 const MAX_CONTEXT_MESSAGES: u32 = 80;
+const MAX_CONTEXT_PAGE_MESSAGES: u32 = MAX_CONTEXT_MESSAGES + 1;
 const MAX_RECENT_ACTIVE_CHANNELS: u32 = 20;
 const MAX_MEMORY_INDEX_ENTRIES: u32 = 100;
 const MAX_SEARCH_PATTERN_CHARS: usize = 256;
@@ -398,8 +399,17 @@ impl Database {
         .await
         .context("failed to load current channel context")?;
 
+        let mut messages = self.context_messages_from_rows(rows).await?;
+        messages.reverse();
+        Ok(messages)
+    }
+
+    async fn context_messages_from_rows(
+        &self,
+        rows: Vec<SqliteRow>,
+    ) -> Result<Vec<ContextMessage>> {
         let mut messages = Vec::with_capacity(rows.len());
-        for row in rows.into_iter().rev() {
+        for row in rows {
             let message_id: i64 = row.try_get("id")?;
             let attachment_rows = sqlx::query(
                 "SELECT filename, content_type, extracted_text, binary_data FROM message_attachments WHERE message_id = ? ORDER BY id",
@@ -455,6 +465,109 @@ impl Database {
         }
 
         Ok(messages)
+    }
+
+    pub async fn messages_newer_than_message(
+        &self,
+        guild_id: u64,
+        channel_id: u64,
+        after_discord_message_id: u64,
+        limit: u32,
+    ) -> Result<Vec<ContextMessage>> {
+        let limit = limit.clamp(1, MAX_CONTEXT_PAGE_MESSAGES);
+        let rows = sqlx::query(
+            r#"
+            SELECT m.id, m.discord_message_id, m.channel_id, m.author_id, m.author_name,
+                   m.content, m.is_bot, m.created_at, m.referenced_message_id,
+                   ref.discord_message_id AS ref_discord_message_id,
+                   ref.channel_id AS ref_channel_id,
+                   ref.author_id AS ref_author_id,
+                   ref.author_name AS ref_author_name,
+                   ref.content AS ref_content,
+                   ref.is_bot AS ref_is_bot,
+                   ref.created_at AS ref_created_at
+            FROM messages AS m
+            INNER JOIN channel_settings AS c
+                ON c.guild_id = m.guild_id
+               AND c.channel_id = COALESCE(m.settings_channel_id, m.channel_id)
+               AND c.mode != 'off'
+            LEFT JOIN messages AS ref
+                ON ref.discord_message_id = m.referenced_message_id
+            WHERE m.guild_id = ? AND m.channel_id = ?
+              AND CAST(m.discord_message_id AS INTEGER) > ?
+            ORDER BY CAST(m.discord_message_id AS INTEGER) ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(after_discord_message_id.to_string())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load messages newer than anchor message")?;
+
+        self.context_messages_from_rows(rows).await
+    }
+
+    pub async fn messages_newer_than_datetime(
+        &self,
+        guild_id: u64,
+        channel_id: u64,
+        after_datetime: &str,
+        after_message_id: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<ContextMessage>> {
+        let limit = limit.clamp(1, MAX_CONTEXT_PAGE_MESSAGES);
+        let after_message_id = after_message_id
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+        let rows = sqlx::query(
+            r#"
+            SELECT m.id, m.discord_message_id, m.channel_id, m.author_id, m.author_name,
+                   m.content, m.is_bot, m.created_at, m.referenced_message_id,
+                   ref.discord_message_id AS ref_discord_message_id,
+                   ref.channel_id AS ref_channel_id,
+                   ref.author_id AS ref_author_id,
+                   ref.author_name AS ref_author_name,
+                   ref.content AS ref_content,
+                   ref.is_bot AS ref_is_bot,
+                   ref.created_at AS ref_created_at
+            FROM messages AS m
+            INNER JOIN channel_settings AS c
+                ON c.guild_id = m.guild_id
+               AND c.channel_id = COALESCE(m.settings_channel_id, m.channel_id)
+               AND c.mode != 'off'
+            LEFT JOIN messages AS ref
+                ON ref.discord_message_id = m.referenced_message_id
+            WHERE m.guild_id = ? AND m.channel_id = ?
+              AND (
+                  strftime('%Y-%m-%dT%H:%M:%fZ', m.created_at) >
+                      strftime('%Y-%m-%dT%H:%M:%fZ', ?)
+                  OR (
+                      strftime('%Y-%m-%dT%H:%M:%fZ', m.created_at) =
+                          strftime('%Y-%m-%dT%H:%M:%fZ', ?)
+                      AND ? <> ''
+                      AND CAST(m.discord_message_id AS INTEGER) > CAST(? AS INTEGER)
+                  )
+              )
+            ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', m.created_at) ASC,
+                     CAST(m.discord_message_id AS INTEGER) ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(after_datetime)
+        .bind(after_datetime)
+        .bind(&after_message_id)
+        .bind(&after_message_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load messages newer than datetime")?;
+
+        self.context_messages_from_rows(rows).await
     }
 
     pub async fn recent_active_channels(
@@ -524,6 +637,65 @@ impl Database {
         .await
         .context("failed to find channel by name")?;
         row.map(parse_id).transpose()
+    }
+
+    pub async fn channel_exists(&self, guild_id: u64, channel_id: u64) -> Result<bool> {
+        let row = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM guild_channels
+                WHERE guild_id = ? AND channel_id = ?
+                UNION
+                SELECT 1 FROM messages
+                WHERE guild_id = ? AND channel_id = ?
+            )
+            "#,
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to check whether channel exists")?;
+        Ok(row != 0)
+    }
+
+    /// Looks up a channel whose id starts with `channel_id`. This recovers
+    /// model-generated snowflakes that lost their trailing digits. Returns
+    /// `None` when nothing matches or when several channels share the prefix.
+    pub async fn find_channel_id_by_prefix(
+        &self,
+        guild_id: u64,
+        channel_id: u64,
+    ) -> Result<Option<u64>> {
+        let prefix = format!("{channel_id}%");
+        let rows = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT channel_id FROM (
+                SELECT channel_id FROM guild_channels
+                WHERE guild_id = ? AND channel_id LIKE ?
+                UNION
+                SELECT channel_id FROM messages
+                WHERE guild_id = ? AND channel_id LIKE ?
+            )
+            GROUP BY channel_id
+            LIMIT 2
+            "#,
+        )
+        .bind(guild_id.to_string())
+        .bind(&prefix)
+        .bind(guild_id.to_string())
+        .bind(&prefix)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to find channel by id prefix")?;
+
+        if rows.len() == 1 {
+            rows.into_iter().next().map(parse_id).transpose()
+        } else {
+            Ok(None)
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -873,6 +1045,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn newer_than_queries_return_chronological_order() {
+        let database = test_database().await;
+        database
+            .set_channel_mode(1, 100, ChannelMode::ReadOnly, 99)
+            .await
+            .unwrap();
+        for (message_id, created_at) in [
+            (1001, "2026-08-09T00:00:00Z"),
+            (1002, "2026-08-09T00:10:00Z"),
+            (1003, "2026-08-09T00:20:00Z"),
+            (1004, "2026-08-09T00:30:00Z"),
+        ] {
+            database
+                .record_message(&IncomingMessage {
+                    discord_message_id: message_id,
+                    guild_id: 1,
+                    channel_id: 100,
+                    channel_name: Some("questions".into()),
+                    settings_channel_id: 100,
+                    author_id: 99,
+                    author_name: "learner".into(),
+                    content: format!("msg {message_id}"),
+                    is_bot: false,
+                    created_at: created_at.into(),
+                    referenced_message_id: None,
+                    referenced_message: None,
+                    attachments: vec![],
+                })
+                .await
+                .unwrap();
+        }
+
+        let by_datetime = database
+            .messages_newer_than_datetime(1, 100, "2026-08-09T00:10:00Z", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            by_datetime.iter().map(|m| m.message_id).collect::<Vec<_>>(),
+            vec![1003, 1004]
+        );
+
+        let by_message = database
+            .messages_newer_than_message(1, 100, 1001, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            by_message.iter().map(|m| m.message_id).collect::<Vec<_>>(),
+            vec![1002, 1003, 1004]
+        );
+
+        let limited = database
+            .messages_newer_than_datetime(1, 100, "2026-08-09T00:00:00Z", None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            limited.iter().map(|m| m.message_id).collect::<Vec<_>>(),
+            vec![1002, 1003]
+        );
+    }
+
+    #[tokio::test]
     async fn current_channel_context_is_isolated_and_chronological() {
         let database = test_database().await;
         database
@@ -944,6 +1177,156 @@ mod tests {
         assert_eq!(
             search[0].message_url,
             "https://discord.com/channels/1/200/11"
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_newer_than_anchor_are_channel_isolated_and_chronological() {
+        let database = test_database().await;
+        database
+            .set_channel_mode(1, 100, ChannelMode::ReadOnly, 99)
+            .await
+            .unwrap();
+        for (message_id, channel_id, content, created_at) in [
+            (10, 100, "first", "2026-08-09T00:00:00Z"),
+            (11, 200, "other channel", "2026-08-09T00:01:00Z"),
+            (12, 100, "second", "2026-08-09T00:02:00Z"),
+            (13, 100, "third", "2026-08-09 00:03:00 +00:00"),
+        ] {
+            database
+                .record_message(&IncomingMessage {
+                    discord_message_id: message_id,
+                    guild_id: 1,
+                    channel_id,
+                    channel_name: Some("questions".into()),
+                    settings_channel_id: channel_id,
+                    author_id: 99,
+                    author_name: "learner".into(),
+                    content: content.into(),
+                    is_bot: false,
+                    created_at: created_at.into(),
+                    referenced_message_id: None,
+                    referenced_message: None,
+                    attachments: vec![],
+                })
+                .await
+                .unwrap();
+        }
+
+        let after_message = database
+            .messages_newer_than_message(1, 100, 10, 80)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_message
+                .iter()
+                .map(|m| m.message_id)
+                .collect::<Vec<_>>(),
+            vec![12, 13]
+        );
+        assert!(
+            database
+                .messages_newer_than_message(1, 100, 13, 80)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            database
+                .messages_newer_than_message(1, 200, 10, 80)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let after_datetime = database
+            .messages_newer_than_datetime(1, 100, "2026-08-09T00:01:30Z", None, 80)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_datetime
+                .iter()
+                .map(|m| m.message_id)
+                .collect::<Vec<_>>(),
+            vec![12, 13]
+        );
+        assert!(
+            database
+                .messages_newer_than_datetime(1, 100, "2026-08-09 00:03:00", None, 80)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn datetime_cursor_preserves_same_timestamp_messages_and_sorts_by_created_at() {
+        let database = test_database().await;
+        database
+            .set_channel_mode(1, 100, ChannelMode::ReadOnly, 99)
+            .await
+            .unwrap();
+        for (message_id, created_at) in [
+            (2002, "2026-08-09T00:00:00.000Z"),
+            (2001, "2026-08-08T23:59:00.000Z"),
+            (2003, "2026-08-09T00:00:00.000Z"),
+            (2004, "2026-08-09T00:00:00.000Z"),
+            (2005, "2026-08-09T00:01:00.000Z"),
+        ] {
+            database
+                .record_message(&IncomingMessage {
+                    discord_message_id: message_id,
+                    guild_id: 1,
+                    channel_id: 100,
+                    channel_name: Some("questions".into()),
+                    settings_channel_id: 100,
+                    author_id: 99,
+                    author_name: "learner".into(),
+                    content: format!("msg {message_id}"),
+                    is_bot: false,
+                    created_at: created_at.into(),
+                    referenced_message_id: None,
+                    referenced_message: None,
+                    attachments: vec![],
+                })
+                .await
+                .unwrap();
+        }
+
+        let first_page = database
+            .messages_newer_than_datetime(1, 100, "2026-08-08T00:00:00Z", None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            first_page
+                .iter()
+                .map(|message| message.message_id)
+                .collect::<Vec<_>>(),
+            vec![2001, 2002]
+        );
+
+        let second_page = database
+            .messages_newer_than_datetime(1, 100, "2026-08-09T00:00:00.000Z", Some(2002), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            second_page
+                .iter()
+                .map(|message| message.message_id)
+                .collect::<Vec<_>>(),
+            vec![2003, 2004]
+        );
+
+        let third_page = database
+            .messages_newer_than_datetime(1, 100, "2026-08-09T00:00:00.000Z", Some(2004), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            third_page
+                .iter()
+                .map(|message| message.message_id)
+                .collect::<Vec<_>>(),
+            vec![2005]
         );
     }
 
