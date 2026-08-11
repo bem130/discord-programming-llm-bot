@@ -144,12 +144,7 @@ if (-not $isWindows) {
     throw 'This script only supports Windows hosts.'
 }
 
-$rawArch = $env:PROCESSOR_ARCHITECTURE
-if ($rawArch -eq "AMD64") {
-    $architecture = "X64"
-} else {
-    $architecture = $rawArch
-}
+$architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 if (-not $limaAssets.ContainsKey($architecture)) {
     throw "Unsupported Windows architecture: $architecture"
 }

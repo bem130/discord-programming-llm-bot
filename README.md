@@ -214,8 +214,8 @@ Discordのtyping表示は10秒で失効するため、Botは回答処理中に8�
 - `execute_code_in_sandbox`: 隔離されたLima VM環境でコード（Rust, Python, C/C++, Go, JavaScript, TypeScript, Haskell, OCaml, Lean 4, Coq, Elm, Common Lisp, Lazy-K等）のコンパイル・検証・標準出力取得を実行
 - `get_channel_recent_messages`: 指定したDiscordチャンネルの直近メッセージをタイムライン順に取得。channel_idまたはchannel_nameで指定し、別チャンネルの文脈把握に利用
 - `get_channel_message_range`: 指定したチャンネル（省略時は現在のチャンネル）の過去メッセージを、最新を1とした1始まりの順位範囲（start_offset〜end_offset）で取得
-- `get_messages_newer_than_message`: 指定したメッセージIDまたはメッセージURLより後に送信されたメッセージを新しい順に取得。続きの確認や途中参加に利用
-- `get_messages_newer_than_datetime`: 指定した日付時刻より後に送信されたメッセージを新しい順に取得。前回確認以降の新着把握に利用。タイムゾーン省略はUTC扱い、日本時間（JST=UTC+9）で指定する場合は末尾に `+09:00` を付ける（例: `2026-08-09T23:00:00+09:00`）。ページング時は直前結果の `created_at` と `message_id` をそれぞれ `datetime` と `after_message_id` に渡す
+- `get_messages_newer_than_message`: 指定したメッセージIDまたはメッセージURLより後に送信されたメッセージを古い順（時系列順）に取得。続きの確認や途中参加に利用
+- `get_messages_newer_than_datetime`: 指定した日付時刻より後に送信されたメッセージを古い順（時系列順）に取得。前回確認以降の新着把握に利用。タイムゾーン省略はUTC扱い、日本時間（JST=UTC+9）で指定する場合は末尾に `+09:00` を付ける（例: `2026-08-09T23:00:00+09:00`）。ページング時は直前結果の `created_at` と `message_id` をそれぞれ `datetime` と `after_message_id` に渡す
 - `explain_compiler_error`: `rustc --explain`を使ってRustエラーコード（E0382等）の公式解説をローカルで取得
 - `format_and_lint_code`: `rustfmt`（Rust）または`python -m py_compile`（Python）をホスト上で直接実行し、整形・構文チェック結果をVMなしで即返す
 

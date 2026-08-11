@@ -73,11 +73,11 @@ fn init_tracing() -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard>
         tracing_appender::non_blocking(tracing_appender::rolling::daily("data/logs", "bot.log"));
 
     tracing_subscriber::registry()
-        .with(filter)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(false)
-                .with_writer(std::io::stdout),
+                .with_writer(std::io::stdout)
+                .with_filter(filter),
         )
         .with(
             tracing_subscriber::fmt::layer()

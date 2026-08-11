@@ -32,6 +32,9 @@ const ANSWER_MAX_TOKENS: u32 = 8_000;
 // 20 rounds accommodate search/memory lookups plus repeated compile-verify-fix-retry
 // cycles, which the code execution tool legitimately needs.
 const MAX_LOCAL_TOOL_ROUNDS: usize = 20;
+const MAX_TOOL_RESULT_HISTORY_CHARS: usize = 12_000;
+const MAX_TOOL_ARGUMENT_HISTORY_CHARS: usize = 8_000;
+const MAX_TOOL_TRANSCRIPT_CHARS: usize = 64_000;
 const MAX_REPLY_DECISION_ATTEMPTS: usize = 3;
 #[cfg(not(test))]
 const REPLY_DECISION_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
@@ -221,6 +224,7 @@ async fn generate_with_tools(
     runner: Option<&dyn CodeRunner>,
     status_sink: Option<&dyn ToolStatusSink>,
 ) -> Result<String> {
+    let base_message_count = messages.len();
     let mut tool_rounds: Vec<String> = Vec::new();
     let mut seen_calls: HashSet<(String, String)> = HashSet::new();
     for round in 0..MAX_LOCAL_TOOL_ROUNDS {
@@ -277,9 +281,15 @@ async fn generate_with_tools(
             .map(|tool_call| tool_call.function.name.clone())
             .collect();
 
+        let historical_tool_calls = response
+            .tool_calls
+            .iter()
+            .cloned()
+            .map(compact_tool_call_for_history)
+            .collect();
         messages.push(PromptMessage::assistant_tool_calls(
             response.content,
-            response.tool_calls.clone(),
+            historical_tool_calls,
         ));
         for tool_call in response.tool_calls {
             let tool_name = tool_call.function.name.clone();
@@ -318,7 +328,10 @@ async fn generate_with_tools(
                     .to_string()
                 }
             };
-            messages.push(PromptMessage::tool_result(tool_call.id, content));
+            messages.push(PromptMessage::tool_result(
+                tool_call.id,
+                truncate_history_text(content, MAX_TOOL_RESULT_HISTORY_CHARS, "ツール結果"),
+            ));
         }
 
         if !duplicate_calls.is_empty() {
@@ -331,6 +344,7 @@ async fn generate_with_tools(
                 duplicate_calls.join(", ")
             )));
         }
+        compact_tool_transcript(messages, base_message_count);
     }
 
     tracing::warn!(
@@ -375,6 +389,85 @@ async fn generate_with_tools(
         "model did not produce content after the local tool round limit and wrap-up attempts; tool calls per round: {}",
         tool_rounds.join(" | ")
     ))
+}
+
+fn compact_tool_call_for_history(mut tool_call: crate::ai::ToolCall) -> crate::ai::ToolCall {
+    let argument_chars = tool_call.function.arguments.chars().count();
+    if argument_chars > MAX_TOOL_ARGUMENT_HISTORY_CHARS {
+        let prefix: String = tool_call
+            .function
+            .arguments
+            .chars()
+            .take(MAX_TOOL_ARGUMENT_HISTORY_CHARS.saturating_sub(256))
+            .collect();
+        tool_call.function.arguments = json!({
+            "history_compacted": true,
+            "original_characters": argument_chars,
+            "prefix": prefix,
+        })
+        .to_string();
+    }
+    tool_call
+}
+
+fn truncate_history_text(text: String, max_chars: usize, label: &str) -> String {
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    let prefix: String = text.chars().take(max_chars).collect();
+    format!("{prefix}\n\n[{label}は会話コンテキスト予算のため省略されました]")
+}
+
+fn prompt_message_chars(message: &PromptMessage) -> usize {
+    let content_chars = match &message.content {
+        crate::ai::PromptContent::Text(text) => text.chars().count(),
+        crate::ai::PromptContent::Parts(parts) => {
+            serde_json::to_string(parts).map_or(0, |serialized| serialized.chars().count())
+        }
+    };
+    content_chars
+        + message.tool_calls.as_ref().map_or(0, |calls| {
+            calls
+                .iter()
+                .map(|call| {
+                    call.function.name.chars().count() + call.function.arguments.chars().count()
+                })
+                .sum()
+        })
+}
+
+fn compact_tool_transcript(messages: &mut Vec<PromptMessage>, base_message_count: usize) {
+    let mut transcript_chars: usize = messages[base_message_count..]
+        .iter()
+        .map(prompt_message_chars)
+        .sum();
+    let mut removed_rounds = 0;
+    const COMPACTION_MARKER_RESERVE_CHARS: usize = 200;
+    while transcript_chars
+        > MAX_TOOL_TRANSCRIPT_CHARS.saturating_sub(COMPACTION_MARKER_RESERVE_CHARS)
+    {
+        let Some(relative_next_round) = messages[base_message_count + 1..]
+            .iter()
+            .position(|message| message.tool_calls.is_some())
+        else {
+            break;
+        };
+        let next_round = base_message_count + 1 + relative_next_round;
+        transcript_chars = transcript_chars.saturating_sub(
+            messages[base_message_count..next_round]
+                .iter()
+                .map(prompt_message_chars)
+                .sum::<usize>(),
+        );
+        messages.drain(base_message_count..next_round);
+        removed_rounds += 1;
+    }
+    if removed_rounds > 0 {
+        let marker = PromptMessage::system(format!(
+            "会話コンテキスト予算を守るため、古いローカルツール往復を{removed_rounds}ラウンド省略しました。以降に残る取得結果を優先して回答してください。"
+        ));
+        messages.insert(base_message_count, marker);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -539,10 +632,7 @@ async fn execute_local_tool(
             let messages = database
                 .recent_channel_context(runtime_context.server.id, channel_id, args.end_offset)
                 .await?;
-            let window: Vec<ContextMessage> = messages
-                .into_iter()
-                .skip((args.start_offset - 1) as usize)
-                .collect();
+            let window = select_recent_range(&messages, args.start_offset, args.end_offset);
             Ok(json!({
                 "ok": true,
                 "channel_id": channel_id,
@@ -758,6 +848,17 @@ async fn execute_local_tool(
         }
         _ => Err(anyhow!("unknown local tool: {name}")),
     }
+}
+
+fn select_recent_range(
+    messages: &[ContextMessage],
+    start_offset: u32,
+    end_offset: u32,
+) -> Vec<ContextMessage> {
+    let available = messages.len();
+    let oldest_index = available.saturating_sub(end_offset as usize);
+    let newest_exclusive = available.saturating_sub((start_offset - 1) as usize);
+    messages[oldest_index..newest_exclusive].to_vec()
 }
 
 async fn review_memory_candidate(
@@ -1329,6 +1430,108 @@ mod tests {
         vec![std::sync::Arc::new(StubModel {
             responses: Mutex::new(VecDeque::new()),
         })]
+    }
+
+    fn context_message(message_id: u64) -> ContextMessage {
+        ContextMessage {
+            message_id,
+            channel_id: 2,
+            author_id: 3,
+            author_name: "user".into(),
+            content: format!("message {message_id}"),
+            is_bot: false,
+            created_at: format!("2026-08-10T00:{message_id:02}:00Z"),
+            reply_to: None,
+            linked_messages: vec![],
+            attachments: vec![],
+        }
+    }
+
+    #[test]
+    fn recent_range_maps_newest_based_offsets_onto_chronological_messages() {
+        let messages: Vec<_> = (1..=10).map(context_message).collect();
+
+        let selected = select_recent_range(&messages, 5, 10);
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|message| message.message_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn recent_range_handles_less_history_than_the_requested_end_offset() {
+        let messages: Vec<_> = (1..=7).map(context_message).collect();
+
+        let selected = select_recent_range(&messages, 5, 10);
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|message| message.message_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn tool_history_is_bounded_by_item_and_total_budgets() {
+        use crate::ai::{ToolCall, ToolFunction};
+
+        let mut messages = vec![PromptMessage::user("original request")];
+        let base_message_count = messages.len();
+        for round in 0..10 {
+            messages.push(PromptMessage::assistant_tool_calls(
+                None,
+                vec![compact_tool_call_for_history(ToolCall {
+                    id: format!("call_{round}"),
+                    kind: "function".into(),
+                    function: ToolFunction {
+                        name: "execute_code_in_sandbox".into(),
+                        arguments: "a".repeat(MAX_TOOL_ARGUMENT_HISTORY_CHARS + 1_000),
+                    },
+                })],
+            ));
+            messages.push(PromptMessage::tool_result(
+                format!("call_{round}"),
+                truncate_history_text(
+                    "r".repeat(MAX_TOOL_RESULT_HISTORY_CHARS + 1_000),
+                    MAX_TOOL_RESULT_HISTORY_CHARS,
+                    "ツール結果",
+                ),
+            ));
+            compact_tool_transcript(&mut messages, base_message_count);
+        }
+
+        assert_eq!(
+            match &messages[0].content {
+                PromptContent::Text(text) => text.as_str(),
+                PromptContent::Parts(_) => panic!("unexpected multipart request"),
+            },
+            "original request"
+        );
+        let transcript_chars: usize = messages[base_message_count..]
+            .iter()
+            .map(prompt_message_chars)
+            .sum();
+        assert!(transcript_chars <= MAX_TOOL_TRANSCRIPT_CHARS);
+        assert!(messages.iter().any(|message| {
+            matches!(&message.content, PromptContent::Text(text) if text.contains("古いローカルツール往復"))
+        }));
+        assert!(
+            messages
+                .iter()
+                .filter_map(|message| message.tool_calls.as_ref())
+                .flatten()
+                .all(|call| {
+                    call.function.arguments.chars().count() <= MAX_TOOL_ARGUMENT_HISTORY_CHARS
+                        && serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                            .is_ok()
+                })
+        );
     }
 
     #[tokio::test]

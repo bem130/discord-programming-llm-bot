@@ -3,8 +3,8 @@ mod commands;
 use std::{
     collections::HashMap,
     sync::{
-        RwLock,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex, RwLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -43,29 +43,85 @@ const GENERATION_FAILURE_MESSAGE: &str = "回答生成またはレビューが�
 
 struct ToolStatusSinkGuard {
     shard: ShardMessenger,
+    coordinator: Arc<ToolActivityCoordinator>,
+    active: AtomicBool,
 }
 
 impl ToolStatusSinkGuard {
-    fn new(shard: ShardMessenger) -> Self {
-        Self { shard }
+    fn new(shard: ShardMessenger, coordinator: Arc<ToolActivityCoordinator>) -> Self {
+        Self {
+            shard,
+            coordinator,
+            active: AtomicBool::new(false),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ToolActivityCoordinator {
+    state: StdMutex<ToolActivityState>,
+}
+
+#[derive(Default)]
+struct ToolActivityState {
+    active_responses: usize,
+}
+
+impl ToolActivityState {
+    fn start(&mut self) {
+        self.active_responses += 1;
+    }
+
+    fn finish(&mut self) -> bool {
+        debug_assert!(self.active_responses > 0);
+        self.active_responses = self.active_responses.saturating_sub(1);
+        self.active_responses == 0
+    }
+}
+
+impl ToolActivityCoordinator {
+    fn start(&self, shard: &ShardMessenger, tool_name: &str) {
+        let mut state = self.state.lock().expect("tool activity lock poisoned");
+        state.start();
+        shard.set_activity(Some(ActivityData::custom(format!(
+            "ツール実行中: {tool_name}"
+        ))));
+    }
+
+    fn update(&self, shard: &ShardMessenger, tool_name: &str) {
+        let _state = self.state.lock().expect("tool activity lock poisoned");
+        shard.set_activity(Some(ActivityData::custom(format!(
+            "ツール実行中: {tool_name}"
+        ))));
+    }
+
+    fn finish(&self, shard: &ShardMessenger) {
+        let mut state = self.state.lock().expect("tool activity lock poisoned");
+        if state.finish() {
+            shard.set_activity(None);
+        }
     }
 }
 
 impl ToolStatusSink for ToolStatusSinkGuard {
     fn tool_started(&self, tool_name: &str) {
-        self.shard.set_activity(Some(ActivityData::custom(format!(
-            "ツール実行中: {tool_name}"
-        ))));
+        if !self.active.swap(true, Ordering::AcqRel) {
+            self.coordinator.start(&self.shard, tool_name);
+        } else {
+            self.coordinator.update(&self.shard, tool_name);
+        }
     }
 
     fn idle(&self) {
-        self.shard.set_activity(None);
+        if self.active.swap(false, Ordering::AcqRel) {
+            self.coordinator.finish(&self.shard);
+        }
     }
 }
 
 impl Drop for ToolStatusSinkGuard {
     fn drop(&mut self) {
-        self.shard.set_activity(None);
+        self.idle();
     }
 }
 
@@ -80,6 +136,7 @@ pub struct DiscordBot {
     bot_name: RwLock<String>,
     settings_channel_cache: RwLock<HashMap<u64, u64>>,
     response_lock: Mutex<()>,
+    tool_activity: Arc<ToolActivityCoordinator>,
     runner: Option<SharedCodeRunner>,
 }
 
@@ -103,6 +160,7 @@ impl DiscordBot {
             bot_name: RwLock::new(String::new()),
             settings_channel_cache: RwLock::new(HashMap::new()),
             response_lock: Mutex::new(()),
+            tool_activity: Arc::new(ToolActivityCoordinator::default()),
             runner,
         }
     }
@@ -429,7 +487,8 @@ impl DiscordBot {
 
         let _typing = TypingGuard::start(context, message.channel_id);
         let memories = self.database.active_memories(self.guild_id.get()).await?;
-        let status_sink = ToolStatusSinkGuard::new(context.shard.clone());
+        let status_sink =
+            ToolStatusSinkGuard::new(context.shard.clone(), Arc::clone(&self.tool_activity));
         let answer = generate_reviewed_answer(
             self.model.as_ref(),
             &current_channel_context,
@@ -880,5 +939,15 @@ mod tests {
         let content = "これを見て: https://discord.com/channels/12345/67890/999888777 あとこれも https://ptb.discord.com/channels/@me/111/222";
         let extracted = extract_discord_message_urls(content);
         assert_eq!(extracted, vec![(67890, 999888777), (111, 222)]);
+    }
+
+    #[test]
+    fn tool_activity_counter_tracks_every_active_response() {
+        let mut state = ToolActivityState::default();
+        state.start();
+        state.start();
+
+        assert!(!state.finish());
+        assert!(state.finish());
     }
 }
