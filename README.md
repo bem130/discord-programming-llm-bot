@@ -96,6 +96,8 @@ CODE_EXECUTION_TIMEOUT_SECS=20
 
 `DISCORD_TOKEN`、`DISCORD_GUILD_ID`、`OPENROUTER_API_KEY`、`DATABASE_URL` は必須です。SQLite migrationは起動時に自動適用されます。PostgreSQLは使用しません。
 
+SQLiteへの書き込みは専用の1接続で順番に実行し、履歴同期・新着保存・編集・削除・設定変更・長期メモリ更新の競合を防ぎます。複数SQLで構成する書き込みは `BEGIN IMMEDIATE` で開始します。ファイル型DBではWALと独立した読み取りプールを使用し、書き込み中も保存済みの会話を検索できます。
+
 `OPENROUTER_TIMEOUT_SECS` はOpenRouterへの1回のHTTP requestの上限秒数です。既定値は120秒で、5〜300秒へ制限されます。接続確立には別途10秒の上限があります。timeout後は通常のmodel retryへ進み、会話チャンネルを永久に占有しません。
 
 ## Lima VMのセットアップ

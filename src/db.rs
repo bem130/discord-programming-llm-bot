@@ -24,6 +24,8 @@ const MAX_SEARCH_EXCERPT_CHARS: usize = 800;
 #[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
+    // All clones share one writer connection; WAL readers retain their own pool.
+    writer: SqlitePool,
 }
 
 impl Database {
@@ -39,18 +41,27 @@ impl Database {
             } else {
                 SqliteJournalMode::Wal
             });
-        let pool = SqlitePoolOptions::new()
-            .max_connections(if is_in_memory { 1 } else { 5 })
-            .connect_with(options)
+        let writer = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
             .await
             .context("failed to connect to SQLite")?;
 
         sqlx::migrate!("./migration")
-            .run(&pool)
+            .run(&writer)
             .await
             .context("failed to run SQLite migrations")?;
 
-        Ok(Self { pool })
+        let pool = if is_in_memory {
+            writer.clone()
+        } else {
+            SqlitePoolOptions::new()
+                .max_connections(5)
+                .connect_with(options)
+                .await
+                .context("failed to connect SQLite readers")?
+        };
+        Ok(Self { pool, writer })
     }
 
     pub async fn channel_mode(&self, guild_id: u64, channel_id: u64) -> Result<ChannelMode> {
@@ -75,12 +86,13 @@ impl Database {
         mode: ChannelMode,
         updated_by: u64,
     ) -> Result<()> {
+        let mut transaction = self.writer.begin_with("BEGIN IMMEDIATE").await?;
         let previous_mode = sqlx::query_scalar::<_, String>(
             "SELECT mode FROM channel_settings WHERE guild_id = ? AND channel_id = ?",
         )
         .bind(guild_id.to_string())
         .bind(channel_id.to_string())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .context("failed to read previous channel setting")?;
 
@@ -98,7 +110,7 @@ impl Database {
         .bind(channel_id.to_string())
         .bind(mode.as_str())
         .bind(updated_by.to_string())
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .context("failed to update channel setting")?;
 
@@ -107,8 +119,18 @@ impl Database {
                 .as_deref()
                 .is_none_or(|value| value == ChannelMode::Off.as_str())
         {
-            self.reset_history_sync(guild_id, channel_id).await?;
+            sqlx::query(
+                "UPDATE channel_history_sync SET completed = 0, updated_at = CURRENT_TIMESTAMP \
+                 WHERE guild_id = ? AND (channel_id = ? OR settings_channel_id = ?)",
+            )
+            .bind(guild_id.to_string())
+            .bind(channel_id.to_string())
+            .bind(channel_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .context("failed to reset channel history sync state")?;
         }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -162,26 +184,9 @@ impl Database {
         .bind(guild_id.to_string())
         .bind(channel_id.to_string())
         .bind(settings_channel_id.to_string())
-        .execute(&self.pool)
+        .execute(&self.writer)
         .await
         .context("failed to mark channel history sync complete")?;
-        Ok(())
-    }
-
-    async fn reset_history_sync(&self, guild_id: u64, channel_id: u64) -> Result<()> {
-        sqlx::query(
-            r#"
-            UPDATE channel_history_sync
-            SET completed = 0, updated_at = CURRENT_TIMESTAMP
-            WHERE guild_id = ? AND (channel_id = ? OR settings_channel_id = ?)
-            "#,
-        )
-        .bind(guild_id.to_string())
-        .bind(channel_id.to_string())
-        .bind(channel_id.to_string())
-        .execute(&self.pool)
-        .await
-        .context("failed to reset channel history sync state")?;
         Ok(())
     }
 
@@ -246,7 +251,7 @@ impl Database {
         .bind(guild_id.to_string())
         .bind(role_id.to_string())
         .bind(updated_by.to_string())
-        .execute(&self.pool)
+        .execute(&self.writer)
         .await
         .context("failed to update invocation role setting")?;
         Ok(())
@@ -255,14 +260,14 @@ impl Database {
     pub async fn clear_invocation_role(&self, guild_id: u64) -> Result<()> {
         sqlx::query("DELETE FROM guild_settings WHERE guild_id = ?")
             .bind(guild_id.to_string())
-            .execute(&self.pool)
+            .execute(&self.writer)
             .await
             .context("failed to clear invocation role setting")?;
         Ok(())
     }
 
     pub async fn record_message(&self, message: &IncomingMessage) -> Result<()> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.writer.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             r#"
             INSERT INTO guild_channels (guild_id, channel_id, channel_name)
@@ -334,7 +339,7 @@ impl Database {
         attachments: Option<&[crate::model::IncomingAttachment]>,
         edited_at: Option<&str>,
     ) -> Result<bool> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.writer.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query("SELECT id, content FROM messages WHERE discord_message_id = ?")
             .bind(discord_message_id.to_string())
             .fetch_optional(&mut *transaction)
@@ -400,7 +405,7 @@ impl Database {
     pub async fn delete_message(&self, discord_message_id: u64) -> Result<bool> {
         let result = sqlx::query("DELETE FROM messages WHERE discord_message_id = ?")
             .bind(discord_message_id.to_string())
-            .execute(&self.pool)
+            .execute(&self.writer)
             .await
             .context("failed to delete message")?;
         Ok(result.rows_affected() == 1)
@@ -408,7 +413,7 @@ impl Database {
 
     pub async fn delete_messages(&self, discord_message_ids: &[u64]) -> Result<u64> {
         let mut deleted = 0;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.writer.begin_with("BEGIN IMMEDIATE").await?;
         for message_id in discord_message_ids {
             deleted += sqlx::query("DELETE FROM messages WHERE discord_message_id = ?")
                 .bind(message_id.to_string())
@@ -833,7 +838,7 @@ impl Database {
         .bind(source_message_id.map(|id| id.to_string()))
         .bind(active)
         .bind(active)
-        .fetch_one(&self.pool)
+        .fetch_one(&self.writer)
         .await
         .context("failed to create guild memory")?;
         Ok(id)
@@ -898,7 +903,7 @@ impl Database {
         )
         .bind(guild_id.to_string())
         .bind(memory_id)
-        .execute(&self.pool)
+        .execute(&self.writer)
         .await
         .context("failed to review guild memory")?;
         Ok(result.rows_affected() == 1)
@@ -914,7 +919,7 @@ impl Database {
         )
         .bind(guild_id.to_string())
         .bind(memory_id)
-        .execute(&self.pool)
+        .execute(&self.writer)
         .await
         .context("failed to remove guild memory")?;
         Ok(result.rows_affected() == 1)
@@ -1119,6 +1124,125 @@ mod tests {
 
     async fn test_database() -> Database {
         Database::connect("sqlite::memory:").await.unwrap()
+    }
+
+    fn concurrent_test_message(id: u64) -> IncomingMessage {
+        IncomingMessage {
+            discord_message_id: id,
+            guild_id: 1,
+            channel_id: 2,
+            channel_name: Some("history".into()),
+            settings_channel_id: 2,
+            author_id: 3,
+            author_name: "learner".into(),
+            content: format!("message {id}"),
+            is_bot: false,
+            created_at: "2026-10-08T00:00:00Z".into(),
+            referenced_message_id: None,
+            referenced_message: None,
+            attachments: vec![IncomingAttachment {
+                filename: "main.rs".into(),
+                content_type: Some("text/plain".into()),
+                size_bytes: 12,
+                extracted_text: Some("fn main() {}".into()),
+                binary_data: None,
+            }],
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_database_preserves_concurrent_history_live_messages_and_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}",
+            directory.path().join("messages.sqlite").display()
+        );
+        let database = Database::connect(&url).await.unwrap();
+        database
+            .set_channel_mode(1, 2, ChannelMode::ReadOnly, 3)
+            .await
+            .unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for id in 1..=100 {
+            let database = database.clone();
+            tasks.spawn(async move {
+                database
+                    .record_message(&concurrent_test_message(id))
+                    .await
+                    .unwrap();
+                // Backfill may encounter a live message that is already saved.
+                database
+                    .record_message(&concurrent_test_message(id))
+                    .await
+                    .unwrap();
+                assert!(
+                    database
+                        .update_message(id, Some("edited"), None, None)
+                        .await
+                        .unwrap()
+                );
+                if id % 2 == 0 {
+                    assert!(database.delete_message(id).await.unwrap());
+                }
+                let _ = database.recent_channel_context(1, 2, 5).await.unwrap();
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE content = 'edited'")
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 50);
+        let attachments: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM message_attachments")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+        assert_eq!(attachments, 50);
+        let revisions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM message_revisions")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+        assert_eq!(revisions, 50);
+        database.pool.close().await;
+        database.writer.close().await;
+
+        let reopened = Database::connect(&url).await.unwrap();
+        assert_eq!(reopened.latest_message_id(1, 2).await.unwrap(), Some(99));
+        reopened.pool.close().await;
+        reopened.writer.close().await;
+    }
+
+    #[tokio::test]
+    async fn wal_reader_remains_available_while_a_writer_is_reserved() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}",
+            directory.path().join("readers.sqlite").display()
+        );
+        let database = Database::connect(&url).await.unwrap();
+        database
+            .set_channel_mode(1, 2, ChannelMode::ReadOnly, 3)
+            .await
+            .unwrap();
+        database
+            .record_message(&concurrent_test_message(1))
+            .await
+            .unwrap();
+        let transaction = database.writer.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let messages = tokio::time::timeout(
+            Duration::from_secs(2),
+            database.recent_channel_context(1, 2, 5),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(messages.len(), 1);
+        transaction.rollback().await.unwrap();
+        database.pool.close().await;
+        database.writer.close().await;
     }
 
     #[tokio::test]
