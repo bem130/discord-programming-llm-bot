@@ -281,7 +281,9 @@ Discordで本文や添付が編集されると保存内容を置換し、本文�
 
 `CODE_RUNNER_ENABLED=true` の場合に `render_tikz_diagram` をモデルへ公開します。Discordで「TikZで処理の流れを図にして」などと依頼すると、モデルがこのtoolを呼びます。送信先チャンネルにはBotの `Attach Files` 権限も必要です。
 
-起動時に既存VMも含めてLuaLaTeX・TikZ・LuaTeX-ja・standalone・Popplerの依存関係を確認し、不足していれば導入します。初回の導入には数分かかる場合があります。Windowsではセットアップ後に新しいPowerShellを開き、Git付属のSSHを含むPATHを反映してください。
+起動時に既存VMも含めてLuaLaTeX・TikZ・LuaTeX-ja・standalone・Popplerの依存関係を確認し、不足していれば導入します。初回の導入には数分かかる場合があります。WindowsではBotがGit付属の `ssh.exe`・`scp.exe`・`ssh-keygen.exe` を探し、Lima子プロセスのPATHで優先します。通常・ユーザー別のGit導入先とPATH上のGitを確認し、親PowerShellやユーザーのPATHは変更しません。見つからない場合は既存PATHを使います。Lima/QEMUを新規導入した直後には新しいPowerShellを開いてください。
+
+`failed to prepare TikZ dependencies` に終了コード255と空出力が表示された場合、依存パッケージではなくLimaのSSH接続失敗を疑ってください。`scripts/setup-lima-windows.ps1` でGitのUnix toolsを導入・確認できます。起動・依存確認のエラーには終了状態、stdout、stderrを表示します。
 
 入力は64,000 bytes以内の完全なLaTeX文書です。`\documentclass[tikz,border=6pt]{standalone}`、`\usepackage{luatexja}`、`tikzpicture` を使います。PDFの先頭ページを長辺最大2,400 pixelsのPNGへ変換し、1画像4 MiB・1回答2画像までに制限します。shell escapeは無効です。依存ファイルの読み取りは許可しますが、VMのhomeは不可視で、書き込み先は実行用一時directoryに限定します。
 

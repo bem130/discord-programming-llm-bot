@@ -108,10 +108,7 @@ impl LimaRunner {
             && !limactl_reports_no_instances(&String::from_utf8_lossy(&instances.stderr))
             && !limactl_reports_no_instances(&String::from_utf8_lossy(&instances.stdout))
         {
-            bail!(
-                "limactl list exited unsuccessfully: {}",
-                String::from_utf8_lossy(&instances.stderr).trim()
-            );
+            bail!("{}", limactl_failure("limactl list", &instances));
         }
         if instance_list_contains(&instances.stdout, &self.instance) {
             run_limactl(
@@ -149,7 +146,7 @@ impl LimaRunner {
     async fn ensure_diagram_dependencies(&self) -> Result<()> {
         let script = "set -e\nif ! (command -v lualatex >/dev/null && command -v pdftoppm >/dev/null && kpsewhich standalone.cls >/dev/null && kpsewhich tikz.sty >/dev/null && kpsewhich luatexja.sty >/dev/null); then sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends texlive-luatex texlive-pictures texlive-latex-extra texlive-lang-japanese poppler-utils; fi\n";
         let output = timeout(Duration::from_secs(600), async {
-            let mut child = Command::new("limactl")
+            let mut child = limactl_command()?
                 .args(["--tty=false", "shell", self.instance.as_str(), "bash", "-s"])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -168,15 +165,8 @@ impl LimaRunner {
         .context("TikZ dependency provisioning timed out")??;
         anyhow::ensure!(
             output.status.success(),
-            "failed to prepare TikZ dependencies: {} {}",
-            String::from_utf8_lossy(&output.stdout)
-                .chars()
-                .take(1000)
-                .collect::<String>(),
-            String::from_utf8_lossy(&output.stderr)
-                .chars()
-                .take(1000)
-                .collect::<String>()
+            "{}",
+            limactl_failure("failed to prepare TikZ dependencies", &output)
         );
         Ok(())
     }
@@ -194,7 +184,7 @@ impl CodeRunner for LimaRunner {
         let _execution_guard = self.execution_lock.lock().await;
 
         let script = build_guest_script(&plan, self.execution_timeout)?;
-        let mut child = Command::new("limactl")
+        let mut child = limactl_command()?
             .args(["--tty=false", "shell", self.instance.as_str(), "bash", "-s"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -310,14 +300,100 @@ fn decode_artifacts(
     ))
 }
 
+// All Lima subprocesses must inherit the same compatible Windows SSH toolchain.
+// Only the child environment is changed; the shell/user PATH remains untouched.
+fn limactl_command() -> Result<Command> {
+    #[allow(unused_mut)]
+    let mut command = Command::new("limactl");
+    #[cfg(windows)]
+    {
+        let search_path = std::env::var_os("PATH").unwrap_or_default();
+        if let Some(directory) = git_unix_tools_directory(
+            &search_path,
+            std::env::var_os("ProgramFiles")
+                .map(std::path::PathBuf::from)
+                .as_deref(),
+            std::env::var_os("LOCALAPPDATA")
+                .map(std::path::PathBuf::from)
+                .as_deref(),
+        ) {
+            let child_path = std::env::join_paths(
+                std::iter::once(directory.clone()).chain(std::env::split_paths(&search_path)),
+            )
+            .context("failed to configure Lima child PATH")?;
+            command.env("PATH", child_path);
+            tracing::debug!(directory = %directory.display(), "selected Git SSH tools for Lima");
+        }
+    }
+    Ok(command)
+}
+
+#[cfg(any(windows, test))]
+fn git_unix_tools_directory(
+    search_path: &std::ffi::OsStr,
+    program_files: Option<&Path>,
+    local_app_data: Option<&Path>,
+) -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    for directory in std::env::split_paths(search_path) {
+        if directory.join("git.exe").is_file()
+            && let Some(root) = directory.parent()
+        {
+            candidates.push(root.join("usr").join("bin"));
+        }
+    }
+    if let Some(root) = program_files {
+        candidates.push(root.join("Git").join("usr").join("bin"));
+    }
+    if let Some(root) = local_app_data {
+        candidates.push(root.join("Programs").join("Git").join("usr").join("bin"));
+    }
+    candidates.into_iter().find(|directory| {
+        ["ssh.exe", "scp.exe", "ssh-keygen.exe"]
+            .iter()
+            .all(|name| directory.join(name).is_file())
+    })
+}
+
+fn limactl_failure(operation: &str, output: &Output) -> String {
+    let bounded = |bytes: &[u8]| {
+        let text: String = String::from_utf8_lossy(bytes)
+            .trim()
+            .chars()
+            .take(1000)
+            .collect();
+        if text.is_empty() {
+            "<empty>".to_string()
+        } else {
+            text
+        }
+    };
+    let hint = if output.status.code() == Some(255)
+        && output.stdout.is_empty()
+        && output.stderr.is_empty()
+    {
+        "; Lima SSH failed without diagnostics: on Windows, install Git SSH tools with scripts/setup-lima-windows.ps1"
+    } else {
+        ""
+    };
+    format!(
+        "{operation} ({}): stdout={} stderr={}{hint}",
+        output.status,
+        bounded(&output.stdout),
+        bounded(&output.stderr)
+    )
+}
+
 async fn run_limactl<'a>(
     args: impl IntoIterator<Item = &'a str>,
     command_timeout: Duration,
 ) -> Result<Output> {
     let output = run_limactl_output(args, command_timeout).await?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("limactl exited unsuccessfully: {}", stderr.trim());
+        bail!(
+            "{}",
+            limactl_failure("limactl exited unsuccessfully", &output)
+        );
     }
     Ok(output)
 }
@@ -328,7 +404,7 @@ async fn run_limactl_output<'a>(
 ) -> Result<Output> {
     timeout(
         command_timeout,
-        Command::new("limactl")
+        limactl_command()?
             .args(args)
             .stdin(Stdio::null())
             .kill_on_drop(true)
@@ -501,6 +577,79 @@ mod tests {
             commands: vec!["rustc src/main.rs && ./src/main".into()],
             output_files: vec![],
         }
+    }
+
+    #[test]
+    fn discovers_complete_git_ssh_toolchain_without_changing_parent_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Portable Git");
+        let cmd = root.join("cmd");
+        let tools = root.join("usr").join("bin");
+        std::fs::create_dir_all(&cmd).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(cmd.join("git.exe"), b"dummy").unwrap();
+        let path = std::env::join_paths([cmd]).unwrap();
+        assert!(git_unix_tools_directory(&path, None, None).is_none());
+        for name in ["ssh.exe", "scp.exe", "ssh-keygen.exe"] {
+            std::fs::write(tools.join(name), b"dummy").unwrap();
+        }
+        assert_eq!(git_unix_tools_directory(&path, None, None), Some(tools));
+        let original = std::env::var_os("PATH");
+        let _ = limactl_command().unwrap();
+        assert_eq!(std::env::var_os("PATH"), original);
+    }
+
+    #[test]
+    fn discovers_standard_and_per_user_git_installations() {
+        let temp = tempfile::tempdir().unwrap();
+        let system_tools = temp.path().join("Git").join("usr").join("bin");
+        let user_tools = temp
+            .path()
+            .join("Programs")
+            .join("Git")
+            .join("usr")
+            .join("bin");
+        for directory in [&system_tools, &user_tools] {
+            std::fs::create_dir_all(directory).unwrap();
+            for name in ["ssh.exe", "scp.exe", "ssh-keygen.exe"] {
+                std::fs::write(directory.join(name), b"dummy").unwrap();
+            }
+        }
+        assert_eq!(
+            git_unix_tools_directory(std::ffi::OsStr::new(""), Some(temp.path()), None),
+            Some(system_tools)
+        );
+        assert_eq!(
+            git_unix_tools_directory(std::ffi::OsStr::new(""), None, Some(temp.path())),
+            Some(user_tools)
+        );
+    }
+
+    #[test]
+    fn failure_diagnostics_include_exit_status_even_with_empty_output() {
+        #[cfg(windows)]
+        let status =
+            <std::process::ExitStatus as std::os::windows::process::ExitStatusExt>::from_raw(255);
+        #[cfg(unix)]
+        let status =
+            <std::process::ExitStatus as std::os::unix::process::ExitStatusExt>::from_raw(255 << 8);
+        let output = Output {
+            status,
+            stdout: vec![],
+            stderr: vec![],
+        };
+        let diagnostic = limactl_failure("dependency check", &output);
+        assert!(diagnostic.contains("255"));
+        assert!(diagnostic.contains("stdout=<empty> stderr=<empty>"));
+        assert!(diagnostic.contains("SSH"));
+        let output = Output {
+            status,
+            stdout: b"dependency missing".to_vec(),
+            stderr: b"package failure".to_vec(),
+        };
+        let diagnostic = limactl_failure("dependency check", &output);
+        assert!(diagnostic.contains("dependency missing"));
+        assert!(diagnostic.contains("package failure"));
     }
 
     #[test]
