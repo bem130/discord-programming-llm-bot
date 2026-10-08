@@ -8,6 +8,8 @@ use crate::runner::{CodeRunner, ExecutionFile, ExecutionPlan, ExecutionResult};
 #[serde(deny_unknown_fields)]
 pub struct TikzArguments {
     pub source: String,
+    #[serde(default)]
+    pub replace: Option<String>,
 }
 
 pub fn tool() -> serde_json::Value {
@@ -18,7 +20,10 @@ pub fn tool() -> serde_json::Value {
             "description": "TikZで図を描きPNGに変換する。成功した図はレビュー済み回答にDiscord添付として送られる。sourceには日本語を含められる完全なLaTeX文書を渡す。\\documentclass[tikz,border=6pt]{standalone}、\\usepackage{luatexja}、\\usepackage{tikz}、必要な\\usetikzlibraryとtikzpictureを含める。LuaLaTeXで処理する。外部ファイルやshell escapeは使わない。コンパイル失敗時は診断を読みsourceを修正して再試行する。",
             "parameters": {
                 "type": "object",
-                "properties": {"source": {"type": "string", "minLength": 1, "maxLength": 64000}},
+            "properties": {
+                "source": {"type": "string", "minLength": 1, "maxLength": 64000},
+                "replace": {"type": "string", "minLength": 1, "maxLength": 32, "description": "修正対象の既存添付名（例: diagram-1.png）。成功時だけこの図と置換し、失敗時は旧候補を保持する。再生成前にclearしない。"}
+            },
                 "required": ["source"],
                 "additionalProperties": false
             }
