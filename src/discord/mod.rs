@@ -1,7 +1,7 @@
 mod commands;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex as StdMutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use serenity::builder::GetMessages;
 use serenity::{
     all::{
         Attachment, Channel, ChannelId, ChannelType, Context, CreateAllowedMentions, CreateMessage,
@@ -18,6 +19,7 @@ use serenity::{
     },
     async_trait,
     gateway::{ActivityData, ShardMessenger},
+    http::Http,
 };
 use tokio::{
     sync::{Mutex, Notify, oneshot, watch},
@@ -79,6 +81,12 @@ struct PreparedConversationResponse {
     action: BotAction,
     custom_emojis: Vec<Emoji>,
     answer: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct HistoryTarget {
+    channel_id: ChannelId,
+    settings_channel_id: ChannelId,
 }
 
 struct ChannelConversationState {
@@ -349,6 +357,8 @@ pub struct DiscordBot {
     conversations: ConversationCoordinator,
     tool_activity: Arc<ToolActivityCoordinator>,
     runner: Option<SharedCodeRunner>,
+    history_sync_started: Arc<AtomicBool>,
+    history_sync_notify: Arc<Notify>,
 }
 
 impl DiscordBot {
@@ -373,7 +383,33 @@ impl DiscordBot {
             conversations: ConversationCoordinator::default(),
             tool_activity: Arc::new(ToolActivityCoordinator::default()),
             runner,
+            history_sync_started: Arc::new(AtomicBool::new(false)),
+            history_sync_notify: Arc::new(Notify::new()),
         }
+    }
+
+    fn start_history_sync(&self, context: &Context) {
+        if self
+            .history_sync_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.history_sync_notify.notify_one();
+            return;
+        }
+
+        let database = self.database.clone();
+        let guild_id = self.guild_id;
+        let http = context.http.clone();
+        let notify = Arc::clone(&self.history_sync_notify);
+        tokio::spawn(async move {
+            loop {
+                if let Err(error) = sync_allowed_history(&http, &database, guild_id).await {
+                    tracing::error!(?error, "failed to synchronize Discord message history");
+                }
+                notify.notified().await;
+            }
+        });
     }
 }
 
@@ -415,6 +451,7 @@ impl EventHandler for DiscordBot {
             ),
             Err(error) => tracing::error!(?error, "failed to register guild commands"),
         }
+        self.start_history_sync(&context);
     }
 
     async fn interaction_create(&self, context: Context, interaction: Interaction) {
@@ -430,6 +467,8 @@ impl EventHandler for DiscordBot {
         {
             tracing::error!(?error, "slash command failed");
             commands::respond_with_generic_error(&context, &command).await;
+        } else {
+            self.start_history_sync(&context);
         }
     }
 
@@ -1135,12 +1174,21 @@ fn inherited_settings_channel_id(
 }
 
 async fn extract_attachments(attachments: &[Attachment]) -> Vec<IncomingAttachment> {
+    extract_attachments_with_binary(attachments, true).await
+}
+
+async fn extract_attachments_with_binary(
+    attachments: &[Attachment],
+    include_binary: bool,
+) -> Vec<IncomingAttachment> {
     let mut extracted = Vec::with_capacity(attachments.len());
     for attachment in attachments {
         let is_text = is_text_attachment(attachment);
         let is_multimodal = is_multimodal_attachment(attachment);
         let should_download = (is_text && attachment.size <= MAX_TEXT_ATTACHMENT_BYTES)
-            || (is_multimodal && attachment.size <= MAX_MULTIMODAL_ATTACHMENT_BYTES);
+            || (include_binary
+                && is_multimodal
+                && attachment.size <= MAX_MULTIMODAL_ATTACHMENT_BYTES);
         let bytes = if should_download {
             match attachment.download().await {
                 Ok(bytes) => Some(bytes),
@@ -1168,10 +1216,347 @@ async fn extract_attachments(attachments: &[Attachment]) -> Vec<IncomingAttachme
             content_type: attachment.content_type.clone(),
             size_bytes: u64::from(attachment.size),
             extracted_text,
-            binary_data: if is_multimodal { bytes } else { None },
+            binary_data: if include_binary && is_multimodal {
+                bytes
+            } else {
+                None
+            },
         });
     }
     extracted
+}
+
+async fn sync_allowed_history(http: &Http, database: &Database, guild_id: GuildId) -> Result<()> {
+    let settings = database.channel_settings(guild_id.get()).await?;
+    let allowed_settings: HashSet<_> = settings
+        .iter()
+        .filter(|setting| setting.mode.stores_messages())
+        .map(|setting| setting.channel_id)
+        .collect();
+    if allowed_settings.is_empty() {
+        return Ok(());
+    }
+
+    let mut targets = HashMap::new();
+    let mut thread_parents = Vec::new();
+
+    match guild_id.channels(http).await {
+        Ok(channels) => {
+            for channel in channels.values() {
+                let settings_channel_id =
+                    inherited_settings_channel_id(channel.id, channel.parent_id, channel.kind);
+                if allowed_settings.contains(&settings_channel_id.get())
+                    && is_history_channel(channel.kind)
+                {
+                    targets.insert(
+                        channel.id.get(),
+                        HistoryTarget {
+                            channel_id: channel.id,
+                            settings_channel_id,
+                        },
+                    );
+                }
+                if allowed_settings.contains(&channel.id.get())
+                    && is_history_thread_parent(channel.kind)
+                {
+                    thread_parents.push(channel.id);
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(?error, "failed to list guild channels for history sync");
+            for channel_id in &allowed_settings {
+                targets.insert(
+                    *channel_id,
+                    HistoryTarget {
+                        channel_id: ChannelId::new(*channel_id),
+                        settings_channel_id: ChannelId::new(*channel_id),
+                    },
+                );
+            }
+        }
+    }
+
+    for parent_id in thread_parents {
+        if let Err(error) = add_archived_threads(http, parent_id, &mut targets).await {
+            tracing::debug!(
+                ?error,
+                parent_id = parent_id.get(),
+                "failed to list archived threads"
+            );
+        }
+    }
+
+    match guild_id.get_active_threads(http).await {
+        Ok(active_threads) => {
+            for thread in active_threads.threads {
+                let Some(parent_id) = thread.parent_id else {
+                    continue;
+                };
+                if allowed_settings.contains(&parent_id.get()) {
+                    targets.insert(
+                        thread.id.get(),
+                        HistoryTarget {
+                            channel_id: thread.id,
+                            settings_channel_id: parent_id,
+                        },
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            tracing::debug!(?error, "failed to list active threads for history sync");
+        }
+    }
+
+    for target in targets.into_values() {
+        match sync_channel_history(http, database, guild_id, target).await {
+            Ok(count) if count > 0 => tracing::info!(
+                channel_id = target.channel_id.get(),
+                settings_channel_id = target.settings_channel_id.get(),
+                count,
+                "synchronized Discord message history"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                ?error,
+                channel_id = target.channel_id.get(),
+                settings_channel_id = target.settings_channel_id.get(),
+                "failed to synchronize one Discord channel history"
+            ),
+        }
+    }
+    Ok(())
+}
+
+async fn add_archived_threads(
+    http: &Http,
+    parent_id: ChannelId,
+    targets: &mut HashMap<u64, HistoryTarget>,
+) -> Result<()> {
+    let public_error = add_archived_thread_pages(http, parent_id, targets, false)
+        .await
+        .err();
+    let private_error = add_archived_thread_pages(http, parent_id, targets, true)
+        .await
+        .err();
+    if let Some(error) = public_error.or(private_error) {
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn add_archived_thread_pages(
+    http: &Http,
+    parent_id: ChannelId,
+    targets: &mut HashMap<u64, HistoryTarget>,
+    private: bool,
+) -> Result<()> {
+    let mut before = None;
+    loop {
+        let threads = if private {
+            parent_id
+                .get_joined_archived_private_threads(http, before, Some(100))
+                .await?
+        } else {
+            parent_id
+                .get_archived_public_threads(http, before, Some(100))
+                .await?
+        };
+        let oldest = threads.threads.iter().map(|thread| thread.id.get()).min();
+        for thread in threads.threads {
+            targets.insert(
+                thread.id.get(),
+                HistoryTarget {
+                    channel_id: thread.id,
+                    settings_channel_id: parent_id,
+                },
+            );
+        }
+        if !threads.has_more || oldest == before || oldest.is_none() {
+            break;
+        }
+        before = oldest;
+    }
+    Ok(())
+}
+
+async fn sync_channel_history(
+    http: &Http,
+    database: &Database,
+    guild_id: GuildId,
+    target: HistoryTarget,
+) -> Result<usize> {
+    let channel_name = target
+        .channel_id
+        .to_channel(http)
+        .await
+        .ok()
+        .and_then(|channel| match channel {
+            Channel::Guild(channel) => Some(channel.name),
+            _ => None,
+        });
+    let completed = database
+        .history_sync_completed(guild_id.get(), target.channel_id.get())
+        .await?;
+    let count = if completed {
+        match database
+            .latest_message_id(guild_id.get(), target.channel_id.get())
+            .await?
+        {
+            Some(after) => {
+                sync_messages_after(
+                    http,
+                    database,
+                    guild_id,
+                    target,
+                    channel_name.as_deref(),
+                    after,
+                )
+                .await?
+            }
+            None => {
+                sync_messages_before(http, database, guild_id, target, channel_name.as_deref())
+                    .await?
+            }
+        }
+    } else {
+        sync_messages_before(http, database, guild_id, target, channel_name.as_deref()).await?
+    };
+    database
+        .mark_history_sync_completed(
+            guild_id.get(),
+            target.channel_id.get(),
+            target.settings_channel_id.get(),
+        )
+        .await?;
+    Ok(count)
+}
+
+async fn sync_messages_before(
+    http: &Http,
+    database: &Database,
+    guild_id: GuildId,
+    target: HistoryTarget,
+    channel_name: Option<&str>,
+) -> Result<usize> {
+    let mut before = None;
+    let mut recorded = 0;
+    loop {
+        let mut builder = GetMessages::new().limit(100);
+        if let Some(before_id) = before {
+            builder = builder.before(MessageId::new(before_id));
+        }
+        let mut messages = target.channel_id.messages(http, builder).await?;
+        if messages.is_empty() {
+            break;
+        }
+        messages.sort_unstable_by_key(|message| message.id.get());
+        let next_before = messages[0].id.get();
+        for message in &messages {
+            record_historical_message(database, guild_id, target, channel_name, message).await?;
+            recorded += 1;
+        }
+        if Some(next_before) == before || messages.len() < 100 {
+            break;
+        }
+        before = Some(next_before);
+    }
+    Ok(recorded)
+}
+
+async fn sync_messages_after(
+    http: &Http,
+    database: &Database,
+    guild_id: GuildId,
+    target: HistoryTarget,
+    channel_name: Option<&str>,
+    after: u64,
+) -> Result<usize> {
+    let mut after = after;
+    let mut recorded = 0;
+    loop {
+        let mut messages = target
+            .channel_id
+            .messages(
+                http,
+                GetMessages::new().after(MessageId::new(after)).limit(100),
+            )
+            .await?;
+        if messages.is_empty() {
+            break;
+        }
+        messages.sort_unstable_by_key(|message| message.id.get());
+        let mut progressed = false;
+        for message in &messages {
+            if message.id.get() <= after {
+                continue;
+            }
+            record_historical_message(database, guild_id, target, channel_name, message).await?;
+            after = message.id.get();
+            recorded += 1;
+            progressed = true;
+        }
+        if !progressed || messages.len() < 100 {
+            break;
+        }
+    }
+    Ok(recorded)
+}
+
+async fn record_historical_message(
+    database: &Database,
+    guild_id: GuildId,
+    target: HistoryTarget,
+    channel_name: Option<&str>,
+    message: &Message,
+) -> Result<()> {
+    let referenced_message_id = message
+        .message_reference
+        .as_ref()
+        .and_then(|reference| reference.message_id.map(|id| id.get()))
+        .or_else(|| {
+            message
+                .referenced_message
+                .as_ref()
+                .map(|message| message.id.get())
+        });
+    let attachments = extract_attachments_with_binary(&message.attachments, false).await;
+    database
+        .record_message(&IncomingMessage {
+            discord_message_id: message.id.get(),
+            guild_id: guild_id.get(),
+            channel_id: target.channel_id.get(),
+            channel_name: channel_name.map(str::to_owned),
+            settings_channel_id: target.settings_channel_id.get(),
+            author_id: message.author.id.get(),
+            author_name: message.author.name.clone(),
+            content: message.content.clone(),
+            is_bot: message.author.bot,
+            created_at: message.timestamp.to_string(),
+            referenced_message_id,
+            referenced_message: None,
+            attachments,
+        })
+        .await
+}
+
+fn is_history_channel(kind: ChannelType) -> bool {
+    matches!(
+        kind,
+        ChannelType::Text
+            | ChannelType::News
+            | ChannelType::PublicThread
+            | ChannelType::PrivateThread
+            | ChannelType::NewsThread
+    )
+}
+
+fn is_history_thread_parent(kind: ChannelType) -> bool {
+    matches!(
+        kind,
+        ChannelType::Text | ChannelType::News | ChannelType::Forum
+    )
 }
 
 fn is_multimodal_attachment(attachment: &Attachment) -> bool {

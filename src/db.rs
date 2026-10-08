@@ -75,6 +75,15 @@ impl Database {
         mode: ChannelMode,
         updated_by: u64,
     ) -> Result<()> {
+        let previous_mode = sqlx::query_scalar::<_, String>(
+            "SELECT mode FROM channel_settings WHERE guild_id = ? AND channel_id = ?",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to read previous channel setting")?;
+
         sqlx::query(
             r#"
             INSERT INTO channel_settings (guild_id, channel_id, mode, updated_by)
@@ -92,6 +101,87 @@ impl Database {
         .execute(&self.pool)
         .await
         .context("failed to update channel setting")?;
+
+        if mode.stores_messages()
+            && previous_mode
+                .as_deref()
+                .is_none_or(|value| value == ChannelMode::Off.as_str())
+        {
+            self.reset_history_sync(guild_id, channel_id).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn history_sync_completed(&self, guild_id: u64, channel_id: u64) -> Result<bool> {
+        let completed = sqlx::query_scalar::<_, i64>(
+            "SELECT completed FROM channel_history_sync WHERE guild_id = ? AND channel_id = ?",
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to read channel history sync state")?;
+        Ok(completed == Some(1))
+    }
+
+    pub async fn latest_message_id(&self, guild_id: u64, channel_id: u64) -> Result<Option<u64>> {
+        let message_id = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT discord_message_id
+            FROM messages
+            WHERE guild_id = ? AND channel_id = ?
+            ORDER BY CAST(discord_message_id AS INTEGER) DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to read latest channel message")?;
+        message_id.map(parse_id).transpose()
+    }
+
+    pub async fn mark_history_sync_completed(
+        &self,
+        guild_id: u64,
+        channel_id: u64,
+        settings_channel_id: u64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO channel_history_sync (
+                guild_id, channel_id, settings_channel_id, completed
+            ) VALUES (?, ?, ?, 1)
+            ON CONFLICT (guild_id, channel_id) DO UPDATE SET
+                settings_channel_id = excluded.settings_channel_id,
+                completed = 1,
+                updated_at = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(settings_channel_id.to_string())
+        .execute(&self.pool)
+        .await
+        .context("failed to mark channel history sync complete")?;
+        Ok(())
+    }
+
+    async fn reset_history_sync(&self, guild_id: u64, channel_id: u64) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE channel_history_sync
+            SET completed = 0, updated_at = CURRENT_TIMESTAMP
+            WHERE guild_id = ? AND (channel_id = ? OR settings_channel_id = ?)
+            "#,
+        )
+        .bind(guild_id.to_string())
+        .bind(channel_id.to_string())
+        .bind(channel_id.to_string())
+        .execute(&self.pool)
+        .await
+        .context("failed to reset channel history sync state")?;
         Ok(())
     }
 
@@ -395,7 +485,7 @@ impl Database {
             LEFT JOIN messages AS ref
                 ON ref.discord_message_id = m.referenced_message_id
             WHERE m.guild_id = ? AND m.channel_id = ?
-            ORDER BY m.id DESC
+            ORDER BY CAST(m.discord_message_id AS INTEGER) DESC
             LIMIT ?
             "#,
         )
@@ -587,7 +677,7 @@ impl Database {
         let rows = sqlx::query(
             r#"
             SELECT m.channel_id, gc.channel_name, m.created_at AS last_message_at,
-                   m.id AS last_message_row_id
+                   CAST(m.discord_message_id AS INTEGER) AS last_message_id
             FROM messages AS m
             INNER JOIN channel_settings AS c
                 ON c.guild_id = m.guild_id
@@ -596,13 +686,13 @@ impl Database {
             LEFT JOIN guild_channels AS gc
                 ON gc.guild_id = m.guild_id AND gc.channel_id = m.channel_id
             WHERE m.guild_id = ?
-              AND m.id = (
-                  SELECT MAX(latest.id)
+              AND CAST(m.discord_message_id AS INTEGER) = (
+                  SELECT MAX(CAST(latest.discord_message_id AS INTEGER))
                   FROM messages AS latest
                   WHERE latest.guild_id = m.guild_id
                     AND latest.channel_id = m.channel_id
               )
-            ORDER BY last_message_row_id DESC
+            ORDER BY last_message_id DESC
             LIMIT ?
             "#,
         )
@@ -871,7 +961,7 @@ impl Database {
             .context("invalid or too complex regular expression")?;
         let limit = limit.clamp(1, MAX_SEARCH_RESULTS) as usize;
         let mut results = Vec::with_capacity(limit);
-        let mut before_id = i64::MAX;
+        let mut before_message_id: Option<u64> = None;
 
         while results.len() < limit {
             let rows = sqlx::query(
@@ -888,17 +978,22 @@ impl Database {
                  LEFT JOIN message_attachments AS a ON a.message_id = m.id
                  LEFT JOIN guild_channels AS gc
                     ON gc.guild_id = m.guild_id AND gc.channel_id = m.channel_id
-                WHERE m.guild_id = ? AND m.id < ?
+                WHERE m.guild_id = ?
+                  AND (
+                      ? IS NULL
+                      OR CAST(m.discord_message_id AS INTEGER) < CAST(? AS INTEGER)
+                  )
                   AND (? IS NULL OR m.channel_id = ?)
                   AND (? IS NULL OR m.author_id = ?)
                   AND (? OR m.is_bot = 0)
                 GROUP BY m.id
-                ORDER BY m.id DESC
+                ORDER BY CAST(m.discord_message_id AS INTEGER) DESC
                 LIMIT ?
                 "#,
             )
             .bind(guild_id.to_string())
-            .bind(before_id)
+            .bind(before_message_id.map(|id| id.to_string()))
+            .bind(before_message_id.map(|id| id.to_string()))
             .bind(channel_id.map(|id| id.to_string()))
             .bind(channel_id.map(|id| id.to_string()))
             .bind(author_id.map(|id| id.to_string()))
@@ -913,7 +1008,6 @@ impl Database {
             }
 
             for row in &rows {
-                before_id = row.try_get("id")?;
                 let message_id = parse_id(row.try_get("discord_message_id")?)?;
                 let channel_id = parse_id(row.try_get("channel_id")?)?;
                 let content: String = row.try_get("content")?;
@@ -937,6 +1031,14 @@ impl Database {
                     break;
                 }
             }
+            let oldest_message_id = rows
+                .last()
+                .map(|row| parse_id(row.try_get("discord_message_id")?))
+                .transpose()?;
+            if oldest_message_id == before_message_id {
+                break;
+            }
+            before_message_id = oldest_message_id;
             if rows.len() < SEARCH_PAGE_SIZE as usize {
                 break;
             }
@@ -1034,6 +1136,112 @@ mod tests {
             ChannelMode::Auto
         );
         assert_eq!(database.channel_settings(1).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn history_sync_state_is_idempotent_and_resets_when_storage_is_reenabled() {
+        let database = test_database().await;
+
+        assert!(!database.history_sync_completed(1, 2).await.unwrap());
+        database
+            .set_channel_mode(1, 2, ChannelMode::ReadOnly, 3)
+            .await
+            .unwrap();
+        database.mark_history_sync_completed(1, 2, 2).await.unwrap();
+        database
+            .mark_history_sync_completed(1, 20, 2)
+            .await
+            .unwrap();
+        assert!(database.history_sync_completed(1, 2).await.unwrap());
+        assert!(database.history_sync_completed(1, 20).await.unwrap());
+
+        database
+            .set_channel_mode(1, 2, ChannelMode::Auto, 3)
+            .await
+            .unwrap();
+        assert!(database.history_sync_completed(1, 2).await.unwrap());
+
+        database
+            .set_channel_mode(1, 2, ChannelMode::Off, 3)
+            .await
+            .unwrap();
+        database
+            .set_channel_mode(1, 2, ChannelMode::ReadOnly, 3)
+            .await
+            .unwrap();
+        assert!(!database.history_sync_completed(1, 2).await.unwrap());
+        assert!(!database.history_sync_completed(1, 20).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn latest_message_id_uses_discord_order_not_insert_order() {
+        let database = test_database().await;
+        database
+            .set_channel_mode(1, 2, ChannelMode::ReadOnly, 3)
+            .await
+            .unwrap();
+        for message_id in [300, 100, 200] {
+            database
+                .record_message(&IncomingMessage {
+                    discord_message_id: message_id,
+                    guild_id: 1,
+                    channel_id: 2,
+                    channel_name: Some("history".into()),
+                    settings_channel_id: 2,
+                    author_id: 4,
+                    author_name: "learner".into(),
+                    content: "message".into(),
+                    is_bot: false,
+                    created_at: "2026-08-09T00:00:00Z".into(),
+                    referenced_message_id: None,
+                    referenced_message: None,
+                    attachments: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(database.latest_message_id(1, 2).await.unwrap(), Some(300));
+    }
+
+    #[tokio::test]
+    async fn search_results_use_discord_recency_after_history_backfill() {
+        let database = test_database().await;
+        database
+            .set_channel_mode(1, 2, ChannelMode::ReadOnly, 3)
+            .await
+            .unwrap();
+        for message_id in [300, 100, 200] {
+            database
+                .record_message(&IncomingMessage {
+                    discord_message_id: message_id,
+                    guild_id: 1,
+                    channel_id: 2,
+                    channel_name: Some("history".into()),
+                    settings_channel_id: 2,
+                    author_id: 4,
+                    author_name: "learner".into(),
+                    content: "needle".into(),
+                    is_bot: false,
+                    created_at: "2026-08-09T00:00:00Z".into(),
+                    referenced_message_id: None,
+                    referenced_message: None,
+                    attachments: vec![],
+                })
+                .await
+                .unwrap();
+        }
+
+        let results = database
+            .search_messages(1, 2, "needle", false, None, None, false, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.message_id)
+                .collect::<Vec<_>>(),
+            vec![300, 200, 100]
+        );
     }
 
     #[tokio::test]

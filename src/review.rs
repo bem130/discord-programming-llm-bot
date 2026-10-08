@@ -157,7 +157,7 @@ async fn semantic_review(
         model,
         ModelRequest::json(
             messages,
-            1_200,
+            2_000,
             "response_review",
             json!({
                 "type": "object",
@@ -170,7 +170,7 @@ async fn semantic_review(
                 "additionalProperties": false
             }),
         )
-        .with_reasoning_effort("none")
+        .with_reasoning_effort("low")
         .with_guild_session(guild_id, AiSessionPurpose::ResponseReview),
         "semantic_review",
     )

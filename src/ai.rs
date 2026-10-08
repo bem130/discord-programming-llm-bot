@@ -9,6 +9,9 @@ use serde_json::{Value, json};
 const OPENROUTER_TITLE: &str = "Discord Learn Programming Bot";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REASONING_REQUIRED_ERROR: &str =
+    "Provider requires reasoning and does not allow disabling it";
+const SERVER_TOOL_FAILURE_ERROR: &str = "Server tool request failed";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PromptMessage {
@@ -306,6 +309,15 @@ impl LanguageModel for OpenRouterClient {
 
     async fn complete_response(&self, request: ModelRequest) -> Result<ModelResponse> {
         match self.complete_response_once(request.clone()).await {
+            Err(error) if request.reasoning.is_some() && is_reasoning_disabled_error(&error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "OpenRouter rejected the requested reasoning override; retrying with provider defaults"
+                );
+                let mut fallback = request.clone();
+                fallback.reasoning = None;
+                self.complete_response_once(fallback).await
+            }
             Err(error)
                 if request.web_search
                     && error
@@ -600,7 +612,13 @@ fn openrouter_status_error(
 }
 
 fn is_server_tool_failure(error: &OpenRouterHttpError) -> bool {
-    error.message.contains("Server tool request failed")
+    error.message == SERVER_TOOL_FAILURE_ERROR
+}
+
+fn is_reasoning_disabled_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<OpenRouterHttpError>()
+        .is_some_and(|error| error.message == REASONING_REQUIRED_ERROR)
 }
 
 fn openrouter_provider_name(body: &str) -> Option<String> {
@@ -608,12 +626,19 @@ fn openrouter_provider_name(body: &str) -> Option<String> {
     parsed
         .pointer("/error/metadata/provider_name")
         .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
+        .map(|name| {
+            name.chars()
+                .filter(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+                })
+                .take(64)
+                .collect()
+        })
+        .filter(|name: &String| !name.is_empty())
 }
 
 fn openrouter_error_message(body: &str) -> String {
     const MAX_INSPECTED_BODY_CHARS: usize = 4_000;
-    const MAX_MESSAGE_CHARS: usize = 300;
 
     let body = body.trim();
     if body.chars().count() > MAX_INSPECTED_BODY_CHARS {
@@ -626,9 +651,19 @@ fn openrouter_error_message(body: &str) -> String {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|message| !message.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| body.to_string());
-    extracted.chars().take(MAX_MESSAGE_CHARS).collect()
+        .unwrap_or(body);
+    let normalized = extracted.to_ascii_lowercase();
+    if normalized.contains("reasoning is mandatory") && normalized.contains("cannot be disabled") {
+        REASONING_REQUIRED_ERROR.to_owned()
+    } else if normalized.contains("server tool request failed") {
+        SERVER_TOOL_FAILURE_ERROR.to_owned()
+    } else if normalized.contains("invalid message") {
+        "Invalid message format".to_owned()
+    } else if normalized.contains("rate limit") {
+        "Rate limit exceeded".to_owned()
+    } else {
+        "OpenRouter rejected the request".to_owned()
+    }
 }
 
 fn message_sequence_shape(messages: &[PromptMessage]) -> String {
@@ -700,6 +735,7 @@ struct ChatCompletionRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<&'a str>,
     messages: &'a [PromptMessage],
+    #[serde(rename = "max_completion_tokens")]
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<Value>,
@@ -831,13 +867,13 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_can_be_disabled_for_short_structured_reviews() {
+    fn reasoning_effort_is_encoded_for_structured_reviews() {
         let request = ModelRequest::json(vec![], 1_200, "review", json!({ "type": "object" }))
-            .with_reasoning_effort("none");
+            .with_reasoning_effort("low");
 
         assert_eq!(
             request.reasoning,
-            Some(json!({ "effort": "none", "exclude": true }))
+            Some(json!({ "effort": "low", "exclude": true }))
         );
     }
 
@@ -885,6 +921,8 @@ mod tests {
             payload["session_id"],
             "discord-learn-programming-bot:guild:123:conversation"
         );
+        assert_eq!(payload["max_completion_tokens"], 100);
+        assert!(payload.get("max_tokens").is_none());
     }
 
     #[test]
@@ -950,13 +988,19 @@ mod tests {
     fn extracts_openrouter_error_message_and_truncates_oversized_bodies() {
         assert_eq!(
             openrouter_error_message(
+                r#"{"error":{"message":"Reasoning is mandatory for this endpoint and cannot be disabled.","code":400}}"#
+            ),
+            REASONING_REQUIRED_ERROR
+        );
+        assert_eq!(
+            openrouter_error_message(
                 r#"{"error":{"message":"Invalid message format","code":400}}"#
             ),
             "Invalid message format"
         );
         assert_eq!(
             openrouter_error_message("plain text body"),
-            "plain text body"
+            "OpenRouter rejected the request"
         );
         assert_eq!(
             openrouter_error_message(&"x".repeat(5_000)),
@@ -967,9 +1011,8 @@ mod tests {
                 r#"{{"error":{{"message":"{}"}}}}"#,
                 "y".repeat(1_000)
             ))
-            .chars()
-            .count(),
-            300
+            .as_str(),
+            "OpenRouter rejected the request"
         );
     }
 
@@ -996,6 +1039,17 @@ mod tests {
             retry_after: None,
             message: "Invalid message format".into(),
         }));
+    }
+
+    #[test]
+    fn detects_provider_rejection_of_disabled_reasoning() {
+        let error: anyhow::Error = OpenRouterHttpError {
+            status: StatusCode::BAD_REQUEST,
+            retry_after: None,
+            message: REASONING_REQUIRED_ERROR.into(),
+        }
+        .into();
+        assert!(is_reasoning_disabled_error(&error));
     }
 
     #[test]

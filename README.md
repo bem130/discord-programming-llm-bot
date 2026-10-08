@@ -205,6 +205,8 @@ cargo run --release
 
 thread内のメッセージはthread IDではなく親チャンネルのモードで判定します。会話の保存先情報と返信先は実際のthreadのままなので、親チャンネルが `mention` または `auto` ならthread内でも同じ動作をします。thread内で `/ai channel` や `/ai status target:` を実行した場合も親チャンネルを対象にします。
 
+Botが起動すると、`read_only`、`mention`、`auto` に設定されたテキスト・ニュースチャンネルと、取得できるactive/archived threadの履歴をDiscord APIから同期します。初回は取得可能な過去メッセージを全ページ取得し、次回以降は保存済みの最新Discord message IDより後だけを取得するため、Bot停止中に投稿されたメッセージも会話検索とコンテキストへ含まれます。`/ai channel`で保存モードを有効にした場合も、そのチャンネルの同期を要求します。BotにDiscord側の閲覧・履歴閲覧権限がないチャンネルはAPIが返す範囲だけが対象で、チャンネル単位の失敗で他チャンネルの同期は止まりません。履歴同期ではテキスト・コード添付の本文を抽出し、画像・PDFなどのバイナリは新着イベント時だけ保存します。
+
 Discordのtyping表示は10秒で失効するため、Botは回答処理中に8秒間隔で更新します。最初の回答chunkを送信し終えるまで表示を維持し、成功・失敗のどちらでも更新taskを停止します。
 
 `/ai` はDiscord側のdefault member permissionと実行時検査の両方で、Manage Server権限を持つ利用者だけに制限しています。
@@ -267,7 +269,7 @@ Discordで本文や添付が編集されると保存内容を置換し、本文�
   -> Rust側で分割してDiscordへ送信
 ```
 
-意味レビューとメモリ審査は最大3回再試行します。これらは短いstructured JSONを返す判定処理なので、Lunaのreasoningを `none` に固定し、通常回答生成のreasoning設定とは分離しています。空応答時のログには使用modelと `finish_reason` を記録します。未レビュー回答や仮メッセージを先に送ることはなく、処理中は8秒更新のtyping表示を使います。
+意味レビューとメモリ審査は最大3回再試行します。これらは短いstructured JSONを返す判定処理ですが、reasoning必須のOpenRouter endpointにも対応できるよう低いreasoning effortを指定し、出力予算を確保しています。providerがreasoning設定の上書きを拒否した場合はprovider既定値へ切り替えて再試行します。空応答時のログには使用modelと `finish_reason` を記録します。未レビュー回答や仮メッセージを先に送ることはなく、処理中は8秒更新のtyping表示を使います。
 
 各promptには具体的な出力例を含めています。運営者方針は [owner_bem130_programming_stance.md](prompt/knowledge/owner_bem130_programming_stance.md) から独立したsystem knowledgeとして読み込みます。これはBotの安全規則やサーバー共通規約ではありません。
 

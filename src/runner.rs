@@ -63,6 +63,9 @@ pub struct LimaRunner {
 
 impl LimaRunner {
     pub fn new(instance: String, template: String, execution_timeout: Duration) -> Result<Self> {
+        if execution_timeout.is_zero() {
+            bail!("execution timeout must be greater than zero");
+        }
         if instance.is_empty()
             || !instance.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
@@ -79,9 +82,19 @@ impl LimaRunner {
     }
 
     pub async fn ensure_ready(&self) -> Result<()> {
-        let instances = run_limactl(["--tty=false", "list", "--quiet"], Duration::from_secs(30))
-            .await
-            .context("failed to list Lima instances")?;
+        let instances =
+            run_limactl_output(["--tty=false", "list", "--quiet"], Duration::from_secs(30))
+                .await
+                .context("failed to list Lima instances")?;
+        if !instances.status.success()
+            && !limactl_reports_no_instances(&String::from_utf8_lossy(&instances.stderr))
+            && !limactl_reports_no_instances(&String::from_utf8_lossy(&instances.stdout))
+        {
+            bail!(
+                "limactl list exited unsuccessfully: {}",
+                String::from_utf8_lossy(&instances.stderr).trim()
+            );
+        }
         if instance_list_contains(&instances.stdout, &self.instance) {
             run_limactl(
                 ["--tty=false", "start", self.instance.as_str()],
@@ -172,21 +185,34 @@ async fn run_limactl<'a>(
     args: impl IntoIterator<Item = &'a str>,
     command_timeout: Duration,
 ) -> Result<Output> {
-    let output = timeout(
-        command_timeout,
-        Command::new("limactl")
-            .args(args)
-            .stdin(Stdio::null())
-            .output(),
-    )
-    .await
-    .context("limactl timed out")?
-    .context("failed to launch limactl")?;
+    let output = run_limactl_output(args, command_timeout).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("limactl exited unsuccessfully: {}", stderr.trim());
     }
     Ok(output)
+}
+
+async fn run_limactl_output<'a>(
+    args: impl IntoIterator<Item = &'a str>,
+    command_timeout: Duration,
+) -> Result<Output> {
+    timeout(
+        command_timeout,
+        Command::new("limactl")
+            .args(args)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("limactl timed out")?
+    .context("failed to launch limactl")
+}
+
+fn limactl_reports_no_instances(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("no instance") || stderr.contains("no instances")
 }
 
 fn instance_list_contains(stdout: &[u8], instance: &str) -> bool {
@@ -358,5 +384,12 @@ mod tests {
         let mut plan = valid_plan();
         plan.system_packages = vec!["a".repeat(MAX_PACKAGE_BYTES + 1)];
         assert!(validate_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn accepts_lima_no_instance_list_message() {
+        assert!(limactl_reports_no_instances("No instance found"));
+        assert!(limactl_reports_no_instances("no instances"));
+        assert!(!limactl_reports_no_instances("permission denied"));
     }
 }

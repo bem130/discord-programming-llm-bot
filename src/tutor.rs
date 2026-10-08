@@ -117,7 +117,7 @@ fn reply_decision_request(
                     .join(", ")
             )),
         ],
-        300,
+        1_200,
         "reply_decision",
         json!({
             "type": "object",
@@ -125,11 +125,14 @@ fn reply_decision_request(
                 "score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
                 "reactions": {
                     "type": "array",
-                    "items": { "type": "string", "maxLength": 64 },
+                    "items": { "type": "string", "minLength": 1, "maxLength": 64 },
                     "maxItems": 3
                 },
-                "reason": { "type": "string" },
-                "reply_to": { "type": ["string", "null"] }
+                "reason": { "type": "string", "minLength": 1, "maxLength": 1000 },
+                "reply_to": {
+                    "type": ["string", "null"],
+                    "pattern": "^[0-9]+$"
+                }
             },
             "required": ["score", "reactions", "reason", "reply_to"],
             "additionalProperties": false
@@ -150,7 +153,10 @@ async fn complete_reply_decision_with_retry(
     for attempt in 1..=max_attempts {
         let model_index = (attempt - 1) % models.len();
         let model = models[model_index].as_ref();
-        match complete_json(model, request.clone()).await {
+        match complete_json::<ReplyDecision>(model, request.clone())
+            .await
+            .and_then(ReplyDecision::validate)
+        {
             Ok(decision) => return Ok(decision),
             Err(error) => {
                 let fallback_delay = REPLY_DECISION_RETRY_BASE_DELAY
@@ -757,10 +763,13 @@ async fn execute_local_tool(
             anyhow::ensure!(code.len() <= 64, "error code too long");
             let explanation = match args.language.to_lowercase().as_str() {
                 "rust" => {
-                    let result = tokio::process::Command::new("rustc")
+                    let child = tokio::process::Command::new("rustc")
                         .args(["--explain", &code])
-                        .output()
+                        .kill_on_drop(true)
+                        .output();
+                    let result = tokio::time::timeout(HOST_CODE_TOOL_TIMEOUT, child)
                         .await
+                        .context("rustc --explain timed out")?
                         .context("failed to run rustc --explain")?;
                     let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
                     let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
@@ -933,7 +942,7 @@ async fn review_memory_candidate(
                     serde_json::to_string(candidate)?
                 )),
             ],
-            800,
+             1_200,
             "memory_review",
             json!({
                 "type": "object",
@@ -945,7 +954,7 @@ async fn review_memory_candidate(
                 "additionalProperties": false
             }),
         )
-        .with_reasoning_effort("none")
+        .with_reasoning_effort("low")
         .with_guild_session(
             runtime_context.server.id,
             AiSessionPurpose::MemoryReview,
@@ -1416,6 +1425,36 @@ struct ReplyDecision {
     reply_to: Option<String>,
 }
 
+impl ReplyDecision {
+    fn validate(self) -> Result<Self> {
+        anyhow::ensure!(
+            self.score.is_finite() && (0.0..=1.0).contains(&self.score),
+            "reply decision score must be between 0 and 1"
+        );
+        anyhow::ensure!(
+            self.reactions.len() <= 3,
+            "reply decision cannot contain more than 3 reactions"
+        );
+        anyhow::ensure!(
+            self.reactions
+                .iter()
+                .all(|reaction| !reaction.is_empty() && reaction.chars().count() <= 64),
+            "reply decision reaction must be 1 to 64 characters"
+        );
+        anyhow::ensure!(
+            !self.reason.trim().is_empty() && self.reason.chars().count() <= 1_000,
+            "reply decision reason must be 1 to 1000 characters"
+        );
+        if let Some(reply_to) = &self.reply_to {
+            anyhow::ensure!(
+                reply_to.parse::<u64>().is_ok(),
+                "reply decision reply_to must be a Discord message ID"
+            );
+        }
+        Ok(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::VecDeque, sync::Mutex};
@@ -1451,6 +1490,40 @@ mod tests {
         vec![std::sync::Arc::new(StubModel {
             responses: Mutex::new(VecDeque::new()),
         })]
+    }
+
+    #[test]
+    fn reply_decision_validation_rejects_unsafe_values() {
+        assert!(
+            ReplyDecision {
+                score: f64::NAN,
+                reactions: vec![],
+                reason: "reason".into(),
+                reply_to: None,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ReplyDecision {
+                score: 0.5,
+                reactions: vec![String::new()],
+                reason: "reason".into(),
+                reply_to: None,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ReplyDecision {
+                score: 0.5,
+                reactions: vec![],
+                reason: "reason".into(),
+                reply_to: Some("not-a-message-id".into()),
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     fn context_message(message_id: u64) -> ContextMessage {
