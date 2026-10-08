@@ -409,16 +409,34 @@ impl OpenRouterClient {
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_secs);
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            let message = openrouter_error_message(&body);
-            if status == StatusCode::BAD_REQUEST {
-                tracing::warn!(
-                    shape = message_sequence_shape(&request.messages),
-                    provider = openrouter_provider_name(&body).unwrap_or_else(|| "unknown".into()),
-                    message = %message,
-                    "OpenRouter 400 rejected request message sequence"
+            let (body, truncated, read_failed) = match read_error_body(response).await {
+                Ok((body, truncated)) => (body, truncated, false),
+                Err(_) => (String::new(), false, true),
+            };
+            let diagnostic = rejection_diagnostics(&body);
+            let mut message = openrouter_error_message(&body);
+            if status == StatusCode::FORBIDDEN {
+                message = format!(
+                    "{message} [error_type={}, scope={}, provider={}, response={}]",
+                    diagnostic.error_type,
+                    diagnostic.scope,
+                    diagnostic.provider,
+                    diagnostic.body_kind
                 );
             }
+            let (image_count, image_chars, text_chars) = request_content_stats(&request.messages);
+            tracing::warn!(
+                status = status.as_u16(),
+                diagnostic = ?diagnostic,
+                response_bytes = body.len(),
+                response_truncated = truncated,
+                response_read_failed = read_failed,
+                shape = message_sequence_shape(&request.messages),
+                image_count, image_chars, text_chars,
+                tool_count = payload.tools.as_ref().map_or(0, Vec::len),
+                web_search = request.web_search,
+                "OpenRouter rejected request (content omitted)"
+            );
             return Err(openrouter_status_error(status, retry_after, message));
         }
 
@@ -613,28 +631,151 @@ fn openrouter_status_error(
 
 fn is_server_tool_failure(error: &OpenRouterHttpError) -> bool {
     error.message == SERVER_TOOL_FAILURE_ERROR
+        && (error.status == StatusCode::BAD_REQUEST || error.status.is_server_error())
 }
 
 fn is_reasoning_disabled_error(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<OpenRouterHttpError>()
-        .is_some_and(|error| error.message == REASONING_REQUIRED_ERROR)
+        .is_some_and(|error| {
+            error.status == StatusCode::BAD_REQUEST && error.message == REASONING_REQUIRED_ERROR
+        })
 }
 
-fn openrouter_provider_name(body: &str) -> Option<String> {
-    let parsed = serde_json::from_str::<Value>(body).ok()?;
-    parsed
-        .pointer("/error/metadata/provider_name")
+async fn read_error_body(mut response: reqwest::Response) -> Result<(String, bool)> {
+    const MAX_BYTES: usize = 64 * 1024;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read OpenRouter error response")?
+    {
+        let remaining = MAX_BYTES - bytes.len();
+        if chunk.len() > remaining {
+            bytes.extend_from_slice(&chunk[..remaining]);
+            return Ok((String::from_utf8_lossy(&bytes).into_owned(), true));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), false))
+}
+
+#[derive(Debug)]
+struct RejectionDiagnostics {
+    body_kind: &'static str,
+    error_type: &'static str,
+    scope: &'static str,
+    provider: &'static str,
+}
+
+fn rejection_diagnostics(body: &str) -> RejectionDiagnostics {
+    // Only fixed labels leave this function: never raw provider errors, flagged input,
+    // moderation patterns, arbitrary codes, or a reflected prompt/API credential.
+    let parsed = serde_json::from_str::<Value>(body).ok();
+    let metadata = parsed
+        .as_ref()
+        .and_then(|value| value.pointer("/error/metadata"));
+    let reported_type = metadata
+        .and_then(|value| value.get("error_type"))
+        .and_then(Value::as_str);
+    const TYPES: &[&str] = &[
+        "authentication",
+        "permission_denied",
+        "payment_required",
+        "content_policy_violation",
+        "refusal",
+        "context_length_exceeded",
+        "max_tokens_exceeded",
+        "token_limit_exceeded",
+        "string_too_long",
+        "rate_limit_exceeded",
+        "provider_overloaded",
+        "provider_unavailable",
+        "invalid_request",
+        "invalid_prompt",
+        "not_found",
+        "precondition_failed",
+        "payload_too_large",
+        "unprocessable",
+        "invalid_image",
+        "image_too_large",
+        "image_too_small",
+        "unsupported_image_format",
+        "image_not_found",
+        "image_download_failed",
+        "server",
+        "timeout",
+        "unmapped",
+    ];
+    let error_type = TYPES
+        .iter()
+        .copied()
+        .find(|kind| Some(*kind) == reported_type)
+        .unwrap_or("unknown");
+    let provider = match metadata
+        .and_then(|value| value.get("provider_name"))
         .and_then(Value::as_str)
-        .map(|name| {
-            name.chars()
-                .filter(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
-                })
-                .take(64)
-                .collect()
-        })
-        .filter(|name: &String| !name.is_empty())
+    {
+        Some("OpenAI") => "OpenAI",
+        Some("Azure") => "Azure",
+        Some("Anthropic") => "Anthropic",
+        Some("Google") | Some("Google AI Studio") | Some("Google Vertex") => "Google",
+        Some("DeepSeek") => "DeepSeek",
+        Some("OpenRouter") => "OpenRouter",
+        Some(_) => "other",
+        None => "unknown",
+    };
+    let scope = if metadata
+        .is_some_and(|value| value.get("patterns").is_some() || value.get("guardrail_id").is_some())
+    {
+        "guardrail"
+    } else if metadata
+        .is_some_and(|value| value.get("flagged_input").is_some() || value.get("reasons").is_some())
+    {
+        "moderation"
+    } else if provider != "unknown" {
+        "provider"
+    } else {
+        "unknown"
+    };
+    let body_kind = if body.trim().is_empty() {
+        "empty"
+    } else if parsed.is_some() {
+        "json"
+    } else if body.trim_start().starts_with('<') {
+        "html_or_xml"
+    } else {
+        "text"
+    };
+    RejectionDiagnostics {
+        body_kind,
+        error_type,
+        scope,
+        provider,
+    }
+}
+
+fn request_content_stats(messages: &[PromptMessage]) -> (usize, usize, usize) {
+    let (mut images, mut image_chars, mut text_chars) = (0, 0, 0);
+    for message in messages {
+        match &message.content {
+            PromptContent::Text(text) => text_chars += text.len(),
+            PromptContent::Parts(parts) => {
+                for part in parts {
+                    match part {
+                        ContentPart::ImageUrl { image_url } => {
+                            images += 1;
+                            image_chars += image_url.url.len();
+                        }
+                        ContentPart::Text { text } => text_chars += text.len(),
+                        ContentPart::File { .. } => {}
+                    }
+                }
+            }
+            PromptContent::Null => {}
+        }
+    }
+    (images, image_chars, text_chars)
 }
 
 fn openrouter_error_message(body: &str) -> String {
@@ -669,6 +810,7 @@ fn openrouter_error_message(body: &str) -> String {
 fn message_sequence_shape(messages: &[PromptMessage]) -> String {
     messages
         .iter()
+        .take(128)
         .map(|message| {
             let role = match message.role {
                 PromptRole::System => "system",
@@ -864,6 +1006,73 @@ fn reference_host_is_local(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejection_diagnostics_preserve_fixed_categories_without_echoing_input() {
+        let body = json!({"error": {"message": "DUMMY_PRIVATE_ECHO", "metadata": {
+            "error_type": "content_policy_violation", "provider_name": "Azure",
+            "flagged_input": "DUMMY_PRIVATE_ECHO", "reasons": ["DUMMY_PRIVATE_ECHO"], "raw": "DUMMY_PRIVATE_ECHO"
+        }}}).to_string();
+        let diagnostic = rejection_diagnostics(&body);
+        assert_eq!(diagnostic.error_type, "content_policy_violation");
+        assert_eq!(diagnostic.scope, "moderation");
+        assert_eq!(diagnostic.provider, "Azure");
+        assert!(!format!("{diagnostic:?}").contains("DUMMY_PRIVATE_ECHO"));
+        let guardrail = rejection_diagnostics(
+            r#"{"error":{"metadata":{"error_type":"permission_denied","patterns":["DUMMY_PRIVATE_ECHO"]}}}"#,
+        );
+        assert_eq!(guardrail.scope, "guardrail");
+        let unknown = rejection_diagnostics(
+            r#"{"error":{"metadata":{"error_type":"DUMMY_PRIVATE_ECHO","provider_name":"DUMMY_PRIVATE_ECHO"}}}"#,
+        );
+        assert_eq!(unknown.error_type, "unknown");
+        assert_eq!(unknown.provider, "other");
+        assert!(!format!("{unknown:?}").contains("DUMMY_PRIVATE_ECHO"));
+        assert_eq!(
+            rejection_diagnostics("<html>access denied</html>").body_kind,
+            "html_or_xml"
+        );
+        assert_eq!(rejection_diagnostics("").body_kind, "empty");
+    }
+
+    #[test]
+    fn forbidden_responses_never_trigger_parameter_or_tool_fallbacks() {
+        for message in [
+            SERVER_TOOL_FAILURE_ERROR,
+            REASONING_REQUIRED_ERROR,
+            "content_policy_violation",
+        ] {
+            let error = OpenRouterHttpError {
+                status: StatusCode::FORBIDDEN,
+                retry_after: Some(Duration::from_secs(1)),
+                message: message.into(),
+            };
+            assert!(!is_server_tool_failure(&error));
+            let error: anyhow::Error = error.into();
+            assert!(!is_reasoning_disabled_error(&error));
+            assert!(model_retry_delay(&error, Duration::from_millis(100)).is_none());
+        }
+    }
+
+    #[test]
+    fn request_diagnostics_measure_images_without_echoing_content() {
+        let messages = vec![
+            PromptMessage::user("private text"),
+            PromptMessage::user_parts(vec![
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,private".into(),
+                    },
+                },
+                ContentPart::Text {
+                    text: "more text".into(),
+                },
+            ]),
+        ];
+        assert_eq!(request_content_stats(&messages), (1, 29, 21));
+        let shape = message_sequence_shape(&messages);
+        assert!(!shape.contains("private"));
+    }
 
     #[test]
     fn references_skip_internal_urls_duplicate_links_and_converter_titles() {
@@ -1098,11 +1307,11 @@ mod tests {
     #[test]
     fn extracts_provider_name_from_error_metadata() {
         let body = r#"{"error":{"message":"Provider returned error","metadata":{"provider_name":"DeepSeek"}}}"#;
-        assert_eq!(openrouter_provider_name(body).as_deref(), Some("DeepSeek"));
-        assert_eq!(openrouter_provider_name("not json"), None);
+        assert_eq!(rejection_diagnostics(body).provider, "DeepSeek");
+        assert_eq!(rejection_diagnostics("not json").provider, "unknown");
         assert_eq!(
-            openrouter_provider_name(r#"{"error":{"message":"boom"}}"#),
-            None
+            rejection_diagnostics(r#"{"error":{"message":"boom"}}"#).provider,
+            "unknown"
         );
     }
 

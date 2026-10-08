@@ -298,6 +298,14 @@ Discordで本文や添付が編集されると保存内容を置換し、本文�
 cargo test diagram::tests::renders_japanese_tikz_in_lima -- --ignored
 ```
 
+## OpenRouterの拒否を調べる
+
+HTTP 403は権限・guardrail・moderationなどの拒否を表します。403だけでAPI keyの不良や画像の問題と断定できません（[公式エラー仕様](https://openrouter.ai/docs/api_reference/errors-and-debugging)）。同じ403を自動再試行したり、Web toolやreasoning設定を外して再送したりはしません。
+
+失敗時には `OpenRouter rejected request (content omitted)` を記録します。診断は固定ラベルの `error_type`、`scope`（guardrail/moderation/provider/unknown）、既知provider、応答形式とサイズ、画像数・文字数、tool数、メッセージのroleと構造だけです。応答本文・providerのraw詳細・flagged input・検出pattern・API key・プロンプト・画像のbase64は出力しません。エラー応答は64 KiBまで取得し、読めない場合も元のHTTPステータスを保ちます。
+
+原因がunknownのままなら、この診断行とHTTPステータスだけを共有してください。`.env` や認証情報、raw応答の共有は不要です。OpenRouter側のActivityやguardrail/権限設定の確認が必要になる場合があります。Windowsの `STATUS_CONTROL_C_EXIT` はCtrl+Cによるプロセス終了で、HTTP拒否とは別です。
+
 ## Limaコード実行の安全境界
 
 `CODE_RUNNER_ENABLED=true` の場合、Botは固定名のLima instanceを起動し、存在しない場合だけtemplateから作成します。既存instanceの起動失敗を新規作成へ誤分類しないため、壊れたinstanceは明示的に再作成するまでエラーにします。
