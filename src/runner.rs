@@ -9,7 +9,12 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncWriteExt, process::Command, sync::Mutex, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+    sync::Mutex,
+    time::timeout,
+};
 
 const MAX_FILES: usize = 12;
 const MAX_FILE_BYTES: usize = 256 * 1024;
@@ -19,6 +24,8 @@ const MAX_COMMAND_BYTES: usize = 4_096;
 const MAX_PACKAGES: usize = 24;
 const MAX_PACKAGE_BYTES: usize = 128;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TRANSFER_BYTES: usize = MAX_OUTPUT_BYTES + MAX_ARTIFACT_BYTES * 2;
 const GUEST_MEMORY_LIMIT_MIB: usize = 1_536;
 const GUEST_TASK_LIMIT: usize = 256;
 
@@ -32,6 +39,9 @@ pub struct ExecutionPlan {
     pub files: Vec<ExecutionFile>,
     #[serde(default)]
     pub commands: Vec<String>,
+    // Output paths are selected by trusted tools, never by model-supplied commands.
+    #[serde(skip)]
+    pub output_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,6 +55,14 @@ pub struct ExecutionResult {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub output: String,
+    #[serde(skip)]
+    pub artifacts: Vec<GeneratedArtifact>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GeneratedArtifact {
+    pub filename: String,
+    pub bytes: Vec<u8>,
 }
 
 #[async_trait]
@@ -102,6 +120,7 @@ impl LimaRunner {
             )
             .await
             .context("failed to start existing Lima instance")?;
+            self.ensure_diagram_dependencies().await?;
             return Ok(());
         }
 
@@ -123,6 +142,42 @@ impl LimaRunner {
         )
         .await
         .context("failed to create or start isolated Lima instance")?;
+        self.ensure_diagram_dependencies().await?;
+        Ok(())
+    }
+
+    async fn ensure_diagram_dependencies(&self) -> Result<()> {
+        let script = "set -e\nif ! (command -v lualatex >/dev/null && command -v pdftoppm >/dev/null && kpsewhich standalone.cls >/dev/null && kpsewhich tikz.sty >/dev/null && kpsewhich luatexja.sty >/dev/null); then sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends texlive-luatex texlive-pictures texlive-latex-extra texlive-lang-japanese poppler-utils; fi\n";
+        let output = timeout(Duration::from_secs(600), async {
+            let mut child = Command::new("limactl")
+                .args(["--tty=false", "shell", self.instance.as_str(), "bash", "-s"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()?;
+            child
+                .stdin
+                .take()
+                .context("missing provision stdin")?
+                .write_all(script.as_bytes())
+                .await?;
+            Ok::<_, anyhow::Error>(child.wait_with_output().await?)
+        })
+        .await
+        .context("TikZ dependency provisioning timed out")??;
+        anyhow::ensure!(
+            output.status.success(),
+            "failed to prepare TikZ dependencies: {} {}",
+            String::from_utf8_lossy(&output.stdout)
+                .chars()
+                .take(1000)
+                .collect::<String>(),
+            String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(1000)
+                .collect::<String>()
+        );
         Ok(())
     }
 }
@@ -147,38 +202,112 @@ impl CodeRunner for LimaRunner {
             .kill_on_drop(true)
             .spawn()
             .context("failed to launch limactl")?;
-        child
-            .stdin
-            .take()
-            .context("failed to open limactl stdin")?
-            .write_all(script.as_bytes())
-            .await
-            .context("failed to send execution plan to Lima")?;
-
         let host_timeout = self.execution_timeout + Duration::from_secs(15);
-        let output = match timeout(host_timeout, child.wait_with_output()).await {
+        let execution = async move {
+            let mut stdin = child.stdin.take().context("failed to open limactl stdin")?;
+            let write_input = async move {
+                stdin.write_all(script.as_bytes()).await?;
+                stdin.shutdown().await
+            };
+            let mut stdout = child
+                .stdout
+                .take()
+                .context("missing limactl stdout")?
+                .take((MAX_TRANSFER_BYTES + 1) as u64);
+            let mut stderr = child
+                .stderr
+                .take()
+                .context("missing limactl stderr")?
+                .take((MAX_OUTPUT_BYTES + 1) as u64);
+            let mut stdout_bytes = Vec::new();
+            let mut stderr_bytes = Vec::new();
+            let (status, _, _, _) = tokio::try_join!(
+                child.wait(),
+                write_input,
+                stdout.read_to_end(&mut stdout_bytes),
+                stderr.read_to_end(&mut stderr_bytes),
+            )?;
+            anyhow::ensure!(
+                stdout_bytes.len() <= MAX_TRANSFER_BYTES,
+                "runner output exceeds transfer limit"
+            );
+            Ok::<_, anyhow::Error>((status, stdout_bytes, stderr_bytes))
+        };
+        let (status, stdout, stderr) = match timeout(host_timeout, execution).await {
             Ok(output) => output.context("limactl execution failed")?,
             Err(_) => {
                 return Ok(ExecutionResult {
                     exit_code: None,
                     timed_out: true,
                     output: "execution exceeded the host-side time limit".to_owned(),
+                    artifacts: vec![],
                 });
             }
         };
-        let mut combined = output.stdout;
-        if !output.stderr.is_empty() {
+        let (mut combined, artifacts) =
+            decode_artifacts(&stdout, &plan.output_files, status.success())?;
+        if !stderr.is_empty() {
             combined.extend_from_slice(b"\n[limactl stderr]\n");
-            combined.extend_from_slice(&output.stderr);
+            combined.extend_from_slice(&stderr);
         }
         combined.truncate(MAX_OUTPUT_BYTES);
 
         Ok(ExecutionResult {
-            exit_code: output.status.code(),
-            timed_out: matches!(output.status.code(), Some(124) | Some(137)),
+            exit_code: status.code(),
+            timed_out: matches!(status.code(), Some(124) | Some(137)),
             output: String::from_utf8_lossy(&combined).into_owned(),
+            artifacts,
         })
     }
+}
+
+fn decode_artifacts(
+    stdout: &[u8],
+    expected: &[String],
+    success: bool,
+) -> Result<(Vec<u8>, Vec<GeneratedArtifact>)> {
+    if expected.is_empty() || !success {
+        return Ok((
+            stdout.iter().copied().take(MAX_OUTPUT_BYTES).collect(),
+            vec![],
+        ));
+    }
+    let text = std::str::from_utf8(stdout).context("invalid artifact transport")?;
+    let (log, payload) = text
+        .rsplit_once("\nDISCORD_ARTIFACTS=")
+        .context("missing artifact transport")?;
+    #[derive(Deserialize)]
+    struct WireArtifact {
+        filename: String,
+        data: String,
+    }
+    let wire: Vec<WireArtifact> = serde_json::from_str(payload.trim())?;
+    anyhow::ensure!(wire.len() == expected.len(), "missing generated artifact");
+    let mut artifacts = Vec::new();
+    for (artifact, name) in wire.into_iter().zip(expected) {
+        anyhow::ensure!(artifact.filename == *name, "unexpected artifact filename");
+        anyhow::ensure!(
+            artifact.data.len() <= MAX_ARTIFACT_BYTES.div_ceil(3) * 4,
+            "artifact transport too large"
+        );
+        let bytes = STANDARD.decode(artifact.data)?;
+        anyhow::ensure!(
+            bytes.len() <= MAX_ARTIFACT_BYTES && bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "invalid PNG artifact"
+        );
+        artifacts.push(GeneratedArtifact {
+            filename: artifact.filename,
+            bytes,
+        });
+    }
+    Ok((
+        log.as_bytes()
+            .iter()
+            .copied()
+            .take(MAX_OUTPUT_BYTES)
+            .collect(),
+        artifacts,
+    ))
 }
 
 async fn run_limactl<'a>(
@@ -222,6 +351,14 @@ fn instance_list_contains(stdout: &[u8], instance: &str) -> bool {
 }
 
 fn validate_plan(plan: &ExecutionPlan) -> Result<()> {
+    anyhow::ensure!(plan.output_files.len() <= 1, "too many output files");
+    for path in &plan.output_files {
+        validate_relative_path(path)?;
+        anyhow::ensure!(
+            !path.contains('/') && path.ends_with(".png"),
+            "output must be a PNG basename"
+        );
+    }
     if plan.files.len() > MAX_FILES {
         bail!("execution plan contains too many files");
     }
@@ -264,6 +401,13 @@ fn validate_plan(plan: &ExecutionPlan) -> Result<()> {
 }
 
 fn validate_relative_path(path: &str) -> Result<()> {
+    anyhow::ensure!(
+        !path.is_empty()
+            && path
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != ".."),
+        "execution file path must contain normal components"
+    );
     let path = Path::new(path);
     if path.is_absolute()
         || path.components().any(|component| {
@@ -328,6 +472,16 @@ fn build_guest_script(plan: &ExecutionPlan, execution_timeout: Duration) -> Resu
         "sudo -n systemd-run --quiet --wait --pipe --collect \\\n  --uid=nobody \\\n  --working-directory=\"$workdir\" \\\n  --setenv=\"HOME=$workdir\" \\\n  --setenv='PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \\\n  --setenv='LANG=C.UTF-8' \\\n  --setenv='RUSTUP_HOME=/usr/local/rustup' \\\n  --setenv='CARGO_HOME=/usr/local/cargo' \\\n  --setenv='ELAN_HOME=/usr/local/elan' \\\n  --property=NoNewPrivileges=yes \\\n  --property=MemoryMax={GUEST_MEMORY_LIMIT_MIB}M \\\n  --property=MemorySwapMax=0 \\\n  --property=CPUQuota=150% \\\n  --property=TasksMax={GUEST_TASK_LIMIT} \\\n  --property=KillMode=control-group \\\n  --property=RuntimeMaxSec={}s \\\n  --property=PrivateTmp=yes \\\n  --property=PrivateDevices=yes \\\n  --property=ProtectSystem=strict \\\n  --property=ProtectHome=yes \\\n  --property=\"ReadWritePaths=$workdir\" \\\n  --property=ProtectKernelTunables=yes \\\n  --property=ProtectKernelModules=yes \\\n  --property=ProtectControlGroups=yes \\\n  --property=ProtectHostname=yes \\\n  --property=RestrictSUIDSGID=yes \\\n  --property=RestrictRealtime=yes \\\n  --property=LockPersonality=yes \\\n  /bin/bash \"$workdir/.discord-wrapper.sh\"\nstatus=$?\nexit \"$status\"\n",
         execution_timeout.as_secs().saturating_add(5)
     ));
+    if !plan.output_files.is_empty() {
+        // Replace only the final exit: collection must run after the control group stops.
+        let ending = "exit \"$status\"\n";
+        script.truncate(script.len() - ending.len());
+        script.push_str(&format!(
+            "sudo -n python3 -I -c \"$(printf '%s' '{}' | base64 --decode)\" \"$workdir\" \"$status\" {} || exit 1\nexit \"$status\"\n",
+            STANDARD.encode(include_str!("runner/collect_artifacts.py")),
+            plan.output_files.iter().map(|name| format!("'{name}'")).collect::<Vec<_>>().join(" ")
+        ));
+    }
     Ok(script)
 }
 
@@ -345,14 +499,57 @@ mod tests {
                 content: "fn main() { println!(\"ok\"); }".into(),
             }],
             commands: vec!["rustc src/main.rs && ./src/main".into()],
+            output_files: vec![],
         }
+    }
+
+    #[test]
+    fn artifact_transport_checks_names_payloads_and_exit_status() {
+        let expected = vec!["diagram.png".to_string()];
+        let payload = serde_json::json!([{"filename": "diagram.png", "data": STANDARD.encode(b"\x89PNG\r\n\x1a\n") }]);
+        let stdout = format!("log\nDISCORD_ARTIFACTS={payload}\n");
+        let (log, artifacts) = decode_artifacts(stdout.as_bytes(), &expected, true).unwrap();
+        assert_eq!(log, b"log");
+        assert_eq!(artifacts.len(), 1);
+        assert!(decode_artifacts(stdout.as_bytes(), &["other.png".into()], true).is_err());
+        assert!(decode_artifacts(b"log", &expected, true).is_err());
+        assert!(decode_artifacts(b"\nDISCORD_ARTIFACTS=[]", &expected, true).is_err());
+        assert!(
+            decode_artifacts(
+                b"\nDISCORD_ARTIFACTS=[{\"filename\":\"diagram.png\",\"data\":\"dGV4dA==\"}]",
+                &expected,
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            decode_artifacts(stdout.as_bytes(), &expected, false)
+                .unwrap()
+                .1
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn model_plans_cannot_request_artifact_extraction() {
+        let plan: ExecutionPlan = serde_json::from_value(serde_json::json!({
+            "execute": true, "explanation": "test", "commands": ["true"], "output_files": ["secret.png"]
+        })).unwrap();
+        assert!(plan.output_files.is_empty());
+        let mut plan = valid_plan();
+        plan.output_files = vec!["../diagram.png".into()];
+        assert!(validate_plan(&plan).is_err());
+        plan.output_files = vec!["sub/diagram.png".into()];
+        assert!(validate_plan(&plan).is_err());
     }
 
     #[test]
     fn rejects_path_traversal() {
         let mut plan = valid_plan();
-        plan.files[0].path = "../host.txt".into();
-        assert!(validate_plan(&plan).is_err());
+        for path in ["../host.txt", "", ".", "a/./b", "a//b", "a/"] {
+            plan.files[0].path = path.into();
+            assert!(validate_plan(&plan).is_err(), "{path}");
+        }
     }
 
     #[test]

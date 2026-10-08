@@ -22,6 +22,7 @@
 - 2,000文字制限を考慮して、Unicodeとコードフェンスを壊しにくい形でRust側から分割送信
 - 通常のUnicode絵文字とサーバー固有絵文字によるリアクションを最大3件追加
 - 任意でLima VMを起動・管理し、Rust、Cargo、GCCなどによるコード検証とapt packageの導入を実行
+- TikZの日本語図をLuaLaTeXでPNGに変換し、画像を含むAIレビューの承認後にDiscordへ添付
 - 運営者 `@bem130` の設計思想を参考knowledgeとして利用。ただし他ユーザーへは強制しない
 
 ## ディレクトリ構成
@@ -51,7 +52,7 @@ Lima公式ではWindows hostが未検証扱いで、WSL2 backendも実験的で�
 
 Botのinstall scopeには `bot` と `applications.commands` を指定します。Bot設定で **Message Content Intent** を有効にしてください。これが無いと通常メッセージ本文や添付情報を取得できません。
 
-推奨Permissions Integerは、thread内の応答と将来の添付送信を含めて次の値です。
+推奨Permissions Integerは、thread内の応答と図の添付送信を含めて次の値です。
 
 ```text
 274878024768
@@ -221,6 +222,7 @@ Discordのtyping表示は10秒で失効するため、Botは回答処理中に8�
 - `get_guild_memory_details`: promptに毎回渡す短い索引から、必要なメモリ詳細だけを取得
 - `propose_guild_memory`: 明示的な依頼がなくても、長期的なプロジェクト判断・教訓・一次資料を検出して保存を提案
 - `execute_code_in_sandbox`: 隔離されたLima VM環境でコード（Rust, Python, C/C++, Go, JavaScript, TypeScript, Haskell, OCaml, Lean 4, Coq, Elm, Common Lisp, Lazy-K等）のコンパイル・検証・標準出力取得を実行
+- `render_tikz_diagram`: 完全なLaTeX文書を `source` に渡し、日本語対応のLuaLaTeXとPopplerでTikZ図をPNGへ変換。成功した画像を回答レビューへ渡し、承認後に本文の最初のメッセージへ添付
 - `get_channel_recent_messages`: 指定したDiscordチャンネルの直近メッセージをタイムライン順に取得。channel_idまたはchannel_nameで指定し、別チャンネルの文脈把握に利用
 - `get_channel_message_range`: 指定したチャンネル（省略時は現在のチャンネル）の過去メッセージを、最新を1とした1始まりの順位範囲（start_offset〜end_offset）で取得
 - `get_messages_newer_than_message`: 指定したメッセージIDまたはメッセージURLより後に送信されたメッセージを古い順（時系列順）に取得。続きの確認や途中参加に利用
@@ -274,6 +276,22 @@ Discordで本文や添付が編集されると保存内容を置換し、本文�
 意味レビューとメモリ審査は最大3回再試行します。これらは短いstructured JSONを返す判定処理ですが、reasoning必須のOpenRouter endpointにも対応できるよう低いreasoning effortを指定し、出力予算を確保しています。providerがreasoning設定の上書きを拒否した場合はprovider既定値へ切り替えて再試行します。空応答時のログには使用modelと `finish_reason` を記録します。未レビュー回答や仮メッセージを先に送ることはなく、処理中は8秒更新のtyping表示を使います。
 
 各promptには具体的な出力例を含めています。運営者方針は [owner_bem130_programming_stance.md](prompt/knowledge/owner_bem130_programming_stance.md) から独立したsystem knowledgeとして読み込みます。これはBotの安全規則やサーバー共通規約ではありません。
+
+## TikZ図の生成と添付
+
+`CODE_RUNNER_ENABLED=true` の場合に `render_tikz_diagram` をモデルへ公開します。Discordで「TikZで処理の流れを図にして」などと依頼すると、モデルがこのtoolを呼びます。送信先チャンネルにはBotの `Attach Files` 権限も必要です。
+
+起動時に既存VMも含めてLuaLaTeX・TikZ・LuaTeX-ja・standalone・Popplerの依存関係を確認し、不足していれば導入します。初回の導入には数分かかる場合があります。Windowsではセットアップ後に新しいPowerShellを開き、Git付属のSSHを含むPATHを反映してください。
+
+入力は64,000 bytes以内の完全なLaTeX文書です。`\documentclass[tikz,border=6pt]{standalone}`、`\usepackage{luatexja}`、`tikzpicture` を使います。PDFの先頭ページを長辺最大2,400 pixelsのPNGへ変換し、1画像4 MiB・1回答2画像までに制限します。shell escapeは無効です。依存ファイルの読み取りは許可しますが、VMのhomeは不可視で、書き込み先は実行用一時directoryに限定します。
+
+画像は実行終了後に固定名の通常ファイルだけを取得し、symlink・hardlink・特殊ファイル・上限超過を拒否します。画像自体をAIレビューへ渡し、承認が取れない場合は添付しません。コンパイル失敗・timeoutはtool結果の `ok=false` と診断として返り、モデルが修正できます。画像の送信は本文と同じretry経路を使用します。
+
+秘密情報やDiscord接続なしでの実VM検証（VMへの依存導入を伴います）:
+
+```powershell
+cargo test diagram::tests::renders_japanese_tikz_in_lima -- --ignored
+```
 
 ## Limaコード実行の安全境界
 

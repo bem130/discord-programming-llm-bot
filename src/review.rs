@@ -54,6 +54,25 @@ pub async fn review_response(
     original_messages: &[PromptMessage],
     generated: String,
 ) -> Result<String> {
+    review_response_impl(model, guild_id, original_messages, generated, false).await
+}
+
+pub async fn review_response_with_artifacts(
+    model: &dyn LanguageModel,
+    guild_id: u64,
+    original_messages: &[PromptMessage],
+    generated: String,
+) -> Result<String> {
+    review_response_impl(model, guild_id, original_messages, generated, true).await
+}
+
+async fn review_response_impl(
+    model: &dyn LanguageModel,
+    guild_id: u64,
+    original_messages: &[PromptMessage],
+    generated: String,
+    require_approval: bool,
+) -> Result<String> {
     let context = review_context(original_messages);
     let mut candidate = generated;
     let mut feedback_history: Vec<String> = Vec::new();
@@ -63,6 +82,7 @@ pub async fn review_response(
         let issues = static_issues(&candidate);
         if !issues.is_empty() {
             if attempt == MAX_REPAIR_ATTEMPTS {
+                anyhow::ensure!(!require_approval, "diagram answer failed static review");
                 warn!(
                     issues = ?issues,
                     "static review still failing; delivering best effort candidate"
@@ -96,6 +116,7 @@ pub async fn review_response(
             "semantic review rejected candidate"
         );
         if attempt == MAX_REPAIR_ATTEMPTS {
+            anyhow::ensure!(!require_approval, "diagram answer failed semantic review");
             let (score, best) = best_candidate.unwrap_or((0, candidate.clone()));
             warn!(
                 score,
@@ -436,6 +457,30 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, "candidate A");
+    }
+
+    #[tokio::test]
+    async fn rejects_diagrams_when_semantic_review_exhausted() {
+        let model = StubModel {
+            responses: Mutex::new(VecDeque::from([
+                r#"{"approved":false,"feedback":"wrong diagram","score":3}"#.into(),
+                "candidate B".into(),
+                r#"{"approved":false,"feedback":"wrong diagram","score":3}"#.into(),
+                "candidate C".into(),
+                r#"{"approved":false,"feedback":"wrong diagram","score":3}"#.into(),
+            ])),
+            requests: Mutex::new(Vec::new()),
+        };
+        assert!(
+            review_response_with_artifacts(
+                &model,
+                123,
+                &[PromptMessage::user("draw")],
+                "candidate A".into()
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]

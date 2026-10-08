@@ -18,7 +18,7 @@ use crate::{
     db::Database,
     model::{ChannelMode, ContextMessage, GuildMemory, MemoryKind, MemoryStatus},
     review::review_response,
-    runner::{CodeRunner, ExecutionPlan},
+    runner::{CodeRunner, ExecutionPlan, GeneratedArtifact},
 };
 
 const REPLY_DECISION_PROMPT: &str = include_str!("../prompt/reply_decision.md");
@@ -46,6 +46,12 @@ const REPLY_DECISION_RETRY_BASE_DELAY: Duration = Duration::ZERO;
 pub trait ToolStatusSink: Send + Sync {
     fn tool_started(&self, tool_name: &str);
     fn idle(&self);
+}
+
+#[derive(Debug, Default)]
+pub struct GeneratedAnswer {
+    pub text: String,
+    pub artifacts: Vec<GeneratedArtifact>,
 }
 
 pub async fn decide_action(
@@ -201,7 +207,7 @@ pub async fn generate_reviewed_answer(
     source_message_id: u64,
     runner: Option<&dyn CodeRunner>,
     status_sink: Option<&dyn ToolStatusSink>,
-) -> Result<String> {
+) -> Result<GeneratedAnswer> {
     let mut messages = conversation_prompt(context, runtime_context, memories);
     let generated = generate_with_tools(
         model,
@@ -218,9 +224,39 @@ pub async fn generate_reviewed_answer(
     if let Some(sink) = status_sink {
         sink.idle();
     }
-    review_response(model, runtime_context.server.id, &messages, generated)
+    // Review the actual images, not just the model's description of them.
+    if !generated.artifacts.is_empty() {
+        use base64::Engine as _;
+        let parts = generated
+            .artifacts
+            .iter()
+            .map(|artifact| crate::ai::ContentPart::ImageUrl {
+                image_url: crate::ai::ImageUrl {
+                    url: format!(
+                        "data:image/png;base64,{}",
+                        base64::engine::general_purpose::STANDARD.encode(&artifact.bytes)
+                    ),
+                },
+            })
+            .collect();
+        messages.push(PromptMessage::user_parts(parts));
+    }
+    let text = if generated.artifacts.is_empty() {
+        review_response(model, runtime_context.server.id, &messages, generated.text).await
+    } else {
+        crate::review::review_response_with_artifacts(
+            model,
+            runtime_context.server.id,
+            &messages,
+            generated.text,
+        )
         .await
-        .context("generated answer did not pass review")
+    }
+    .context("generated answer did not pass review")?;
+    Ok(GeneratedAnswer {
+        text,
+        artifacts: generated.artifacts,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -233,35 +269,38 @@ async fn generate_with_tools(
     messages: &mut Vec<PromptMessage>,
     runner: Option<&dyn CodeRunner>,
     status_sink: Option<&dyn ToolStatusSink>,
-) -> Result<String> {
+) -> Result<GeneratedAnswer> {
+    let mut artifacts = Vec::new();
     let base_message_count = messages.len();
     let mut tool_rounds: Vec<String> = Vec::new();
     let mut seen_calls: HashSet<(String, String)> = HashSet::new();
     for round in 0..MAX_LOCAL_TOOL_ROUNDS {
         let mut request = ModelRequest::text_with_web_search(messages.clone(), ANSWER_MAX_TOKENS)
-            .with_tool(conversation_search_tool())
-            .with_tool(memory_details_tool())
-            .with_tool(memory_candidate_tool())
-            .with_tool(channel_recent_messages_tool())
-            .with_tool(channel_message_range_tool())
-            .with_tool(messages_newer_than_message_tool())
-            .with_tool(messages_newer_than_datetime_tool())
-            .with_tool(explain_compiler_error_tool())
-            .with_tool(format_and_lint_code_tool())
             .with_guild_session(runtime_context.server.id, AiSessionPurpose::Conversation);
-        if runner.is_some() {
-            request = request.with_tool(code_execution_tool());
+        for tool in local_tool_definitions(runner.is_some()) {
+            if tool["function"]["name"] != "render_tikz_diagram" || artifacts.len() < 2 {
+                request = request.with_tool(tool);
+            }
         }
         let response = complete_response_with_retry(model, request, "answer_generation").await?;
         if response.tool_calls.is_empty() {
-            return response
+            let text = response
                 .content
                 .filter(|content| !content.trim().is_empty())
-                .context("model returned neither content nor tool calls");
+                .context("model returned neither content nor tool calls")?;
+            return Ok(GeneratedAnswer { text, artifacts });
         }
         anyhow::ensure!(
             response.tool_calls.len() <= 8,
             "model requested too many local tools in one round"
+        );
+        let mut ids = HashSet::new();
+        anyhow::ensure!(
+            response
+                .tool_calls
+                .iter()
+                .all(|call| call.kind == "function" && !call.id.is_empty() && ids.insert(&call.id)),
+            "tool calls must have unique nonempty IDs and function type"
         );
 
         let tool_names: Vec<_> = response
@@ -306,17 +345,21 @@ async fn generate_with_tools(
             if let Some(sink) = status_sink {
                 sink.tool_started(&tool_name);
             }
-            let result = execute_local_tool(
-                model,
-                database,
-                runtime_context,
-                source_message_id,
-                context,
-                runner,
-                &tool_call.function.name,
-                &tool_call.function.arguments,
-            )
-            .await;
+            let result = if tool_name == "render_tikz_diagram" {
+                render_diagram_tool(runner, &tool_call.function.arguments, &mut artifacts).await
+            } else {
+                execute_local_tool(
+                    model,
+                    database,
+                    runtime_context,
+                    source_message_id,
+                    context,
+                    runner,
+                    &tool_call.function.name,
+                    &tool_call.function.arguments,
+                )
+                .await
+            };
             let content = match result {
                 Ok(value) => {
                     tracing::info!(
@@ -375,10 +418,11 @@ async fn generate_with_tools(
         let response =
             complete_response_with_retry(model, request, "answer_generation_wrap_up").await?;
         if response.tool_calls.is_empty() {
-            return response
+            let text = response
                 .content
                 .filter(|content| !content.trim().is_empty())
-                .context("model returned neither content nor tool calls during wrap-up");
+                .context("model returned neither content nor tool calls during wrap-up")?;
+            return Ok(GeneratedAnswer { text, artifacts });
         }
         wrap_up_messages.push(PromptMessage::assistant_tool_calls(
             response.content,
@@ -492,6 +536,7 @@ async fn execute_local_tool(
     name: &str,
     arguments: &str,
 ) -> Result<serde_json::Value> {
+    validate_tool_arguments(name, arguments, runner.is_some())?;
     match name {
         "search_conversation_history" => {
             let args: ConversationSearchArguments =
@@ -574,7 +619,7 @@ async fn execute_local_tool(
                 serde_json::from_str(arguments).context("invalid code execution plan arguments")?;
             let result = runner.execute(plan).await?;
             Ok(json!({
-                "ok": true,
+                "ok": result.exit_code == Some(0) && !result.timed_out,
                 "exit_code": result.exit_code,
                 "timed_out": result.timed_out,
                 "output": result.output
@@ -666,9 +711,28 @@ async fn execute_local_tool(
             let args: NewerThanMessageArgs = serde_json::from_str(arguments)
                 .context("invalid get_messages_newer_than_message arguments")?;
             let (url_channel_id, url_message_id) = match &args.message_url {
-                Some(url) => message_url_parts(url).with_context(|| {
-                    format!("message URL must end with a numeric channel/message id: {url}")
-                })?,
+                Some(url) => {
+                    let (guild, channel, message) = message_url_parts(url)
+                        .context("expected an HTTPS Discord guild message URL")?;
+                    anyhow::ensure!(
+                        guild == runtime_context.server.id,
+                        "message URL belongs to another server"
+                    );
+                    anyhow::ensure!(
+                        args.channel_id.is_none_or(|id| id == channel)
+                            && args.message_id.is_none_or(|id| id == message),
+                        "message URL conflicts with explicit IDs"
+                    );
+                    if let Some(name) = args.channel_name.as_deref() {
+                        let resolved =
+                            resolve_channel_id(database, guild, None, Some(name), channel).await?;
+                        anyhow::ensure!(
+                            resolved == channel,
+                            "message URL conflicts with channel_name"
+                        );
+                    }
+                    (Some(channel), Some(message))
+                }
                 None => (None, None),
             };
             let after_message_id = match args.message_id {
@@ -817,18 +881,16 @@ async fn execute_local_tool(
                         .kill_on_drop(true)
                         .spawn()
                         .context("failed to spawn rustfmt")?;
-                    if let Some(mut stdin) = child.stdin.take() {
-                        use tokio::io::AsyncWriteExt;
-                        stdin
-                            .write_all(args.code.as_bytes())
-                            .await
-                            .context("failed to write to rustfmt stdin")?;
-                    }
-                    let output =
-                        tokio::time::timeout(HOST_CODE_TOOL_TIMEOUT, child.wait_with_output())
-                            .await
-                            .context("rustfmt timed out")?
-                            .context("rustfmt failed")?;
+                    let output = tokio::time::timeout(HOST_CODE_TOOL_TIMEOUT, async move {
+                        if let Some(mut stdin) = child.stdin.take() {
+                            use tokio::io::AsyncWriteExt;
+                            stdin.write_all(args.code.as_bytes()).await?;
+                        }
+                        child.wait_with_output().await
+                    })
+                    .await
+                    .context("rustfmt timed out")?
+                    .context("rustfmt failed")?;
                     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
                     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
                     Ok(json!({
@@ -878,6 +940,37 @@ async fn execute_local_tool(
         }
         _ => Err(anyhow!("unknown local tool: {name}")),
     }
+}
+
+async fn render_diagram_tool(
+    runner: Option<&dyn CodeRunner>,
+    arguments: &str,
+    artifacts: &mut Vec<GeneratedArtifact>,
+) -> Result<serde_json::Value> {
+    validate_tool_arguments("render_tikz_diagram", arguments, runner.is_some())?;
+    anyhow::ensure!(
+        artifacts.len() < 2,
+        "at most two diagrams can be attached per answer"
+    );
+    let runner = runner.context("code runner is not configured in this environment")?;
+    let result = crate::diagram::render(runner, arguments).await?;
+    let ok = result.exit_code == Some(0) && !result.timed_out;
+    let mut filename = None;
+    if ok {
+        let mut artifact = result
+            .artifacts
+            .into_iter()
+            .next()
+            .context("missing rendered image")?;
+        artifact.filename = format!("diagram-{}.png", artifacts.len() + 1);
+        filename = Some(artifact.filename.clone());
+        artifacts.push(artifact);
+    }
+    Ok(
+        json!({"ok": ok, "exit_code": result.exit_code, "timed_out": result.timed_out,
+        "diagnostics": result.output, "attachment": filename,
+        "delivery": "成功した画像は回答レビュー後に本文へ添付されます。送信完了を先に宣言しないでください。"}),
+    )
 }
 
 fn select_recent_range(
@@ -965,6 +1058,121 @@ async fn review_memory_candidate(
     .context("AI memory review failed")
 }
 
+fn local_tool_definitions(with_runner: bool) -> Vec<serde_json::Value> {
+    let mut tools = vec![
+        conversation_search_tool(),
+        memory_details_tool(),
+        memory_candidate_tool(),
+        channel_recent_messages_tool(),
+        channel_message_range_tool(),
+        messages_newer_than_message_tool(),
+        messages_newer_than_datetime_tool(),
+        explain_compiler_error_tool(),
+        format_and_lint_code_tool(),
+    ];
+    if with_runner {
+        tools.extend([code_execution_tool(), crate::diagram::tool()]);
+    }
+    tools
+}
+
+fn validate_tool_arguments(name: &str, arguments: &str, with_runner: bool) -> Result<()> {
+    anyhow::ensure!(
+        arguments.len() <= 2 * 1024 * 1024,
+        "tool arguments exceed size limit"
+    );
+    let tool = local_tool_definitions(with_runner)
+        .into_iter()
+        .find(|tool| tool["function"]["name"] == name)
+        .context("tool is not available")?;
+    let value: serde_json::Value =
+        serde_json::from_str(arguments).context("invalid tool arguments JSON")?;
+    validate_tool_schema(&value, &tool["function"]["parameters"])
+}
+
+// These definitions use this small schema subset. Validate the same contract we advertise.
+fn validate_tool_schema(value: &serde_json::Value, schema: &serde_json::Value) -> Result<()> {
+    use serde_json::Value;
+    let matches_type = |kind: &str| match kind {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "integer" => value.as_u64().is_some() || value.as_i64().is_some(),
+        "number" => value.is_number(),
+        "null" => value.is_null(),
+        _ => false,
+    };
+    let valid_type = match schema.get("type") {
+        Some(Value::String(kind)) => matches_type(kind),
+        Some(Value::Array(kinds)) => kinds
+            .iter()
+            .any(|kind| kind.as_str().is_some_and(matches_type)),
+        None => true,
+        _ => false,
+    };
+    anyhow::ensure!(valid_type, "tool argument type does not match schema");
+    if let Some(choices) = schema["enum"].as_array() {
+        anyhow::ensure!(
+            choices.contains(value),
+            "tool argument is outside allowed enum"
+        );
+    }
+    if let Some(object) = value.as_object() {
+        if let Some(required) = schema["required"].as_array() {
+            anyhow::ensure!(
+                required
+                    .iter()
+                    .all(|key| key.as_str().is_some_and(|key| object.contains_key(key))),
+                "missing required tool argument"
+            );
+        }
+        for (key, value) in object {
+            let properties = &schema["properties"];
+            if let Some(field) = properties.get(key) {
+                validate_tool_schema(value, field)?;
+            } else {
+                anyhow::ensure!(
+                    schema["additionalProperties"] != Value::Bool(false),
+                    "unknown tool argument"
+                );
+            }
+        }
+    }
+    if let Some(array) = value.as_array() {
+        validate_size(array.len(), schema, "minItems", "maxItems")?;
+        if let Some(items) = schema.get("items") {
+            for item in array {
+                validate_tool_schema(item, items)?;
+            }
+        }
+    }
+    if let Some(text) = value.as_str() {
+        validate_size(text.chars().count(), schema, "minLength", "maxLength")?;
+    }
+    if let Some(number) = value.as_f64() {
+        anyhow::ensure!(
+            schema["minimum"].as_f64().is_none_or(|min| number >= min)
+                && schema["maximum"].as_f64().is_none_or(|max| number <= max),
+            "tool numeric argument is outside bounds"
+        );
+    }
+    Ok(())
+}
+
+fn validate_size(size: usize, schema: &serde_json::Value, min: &str, max: &str) -> Result<()> {
+    anyhow::ensure!(
+        schema[min]
+            .as_u64()
+            .is_none_or(|bound| size as u64 >= bound)
+            && schema[max]
+                .as_u64()
+                .is_none_or(|bound| size as u64 <= bound),
+        "tool argument size is outside bounds"
+    );
+    Ok(())
+}
+
 fn conversation_search_tool() -> serde_json::Value {
     json!({
         "type": "function",
@@ -1041,7 +1249,7 @@ fn code_execution_tool() -> serde_json::Value {
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "execute": { "type": "boolean", "description": "trueに固定する" },
+                    "execute": { "type": "boolean", "enum": [true], "description": "trueに固定する" },
                     "explanation": { "type": "string", "description": "コード実行の目的や検証内容の簡潔な説明" },
                     "system_packages": {
                         "type": "array",
@@ -1208,15 +1416,36 @@ async fn resolve_channel_id(
     Ok(fallback)
 }
 
-fn message_url_parts(url: &str) -> Option<(Option<u64>, Option<u64>)> {
-    let mut parts = url.trim().trim_end_matches('/').rsplit('/');
-    let message_id = parts.next().and_then(|part| part.parse().ok());
-    let channel_id = parts.next().and_then(|part| part.parse().ok());
-    if message_id.is_none() && channel_id.is_none() {
-        None
-    } else {
-        Some((channel_id, message_id))
+fn message_url_parts(url: &str) -> Option<(u64, u64, u64)> {
+    let url = reqwest::Url::parse(url.trim()).ok()?;
+    if url.scheme() != "https"
+        || !matches!(
+            url.host_str()?,
+            "discord.com" | "ptb.discord.com" | "canary.discord.com"
+        )
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
     }
+    let parts: Vec<_> = url.path().trim_end_matches('/').split('/').collect();
+    if parts.len() != 5 || !parts[0].is_empty() || parts[1] != "channels" {
+        return None;
+    }
+    let parse_id = |part: &str| -> Option<u64> {
+        if part.is_empty() || !part.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        part.parse().ok().filter(|id| *id != 0)
+    };
+    Some((
+        parse_id(parts[2])?,
+        parse_id(parts[3])?,
+        parse_id(parts[4])?,
+    ))
 }
 
 fn normalize_datetime_to_utc(value: &str) -> Result<String> {
@@ -1493,6 +1722,180 @@ mod tests {
     }
 
     #[test]
+    fn tool_arguments_follow_the_advertised_contract() {
+        assert!(
+            validate_tool_arguments("render_tikz_diagram", r#"{"source":"tex"}"#, true).is_ok()
+        );
+        for args in [
+            r#"{}"#,
+            r#"{"source":12}"#,
+            r#"{"source":""}"#,
+            r#"{"source":"tex","commands":[]}"#,
+        ] {
+            assert!(validate_tool_arguments("render_tikz_diagram", args, true).is_err());
+        }
+        assert!(
+            validate_tool_arguments("render_tikz_diagram", r#"{"source":"tex"}"#, false).is_err()
+        );
+        assert!(validate_tool_arguments("unknown", "{}", true).is_err());
+        assert!(
+            validate_tool_arguments(
+                "search_conversation_history",
+                r#"{"pattern":"test","regex":false,"channel_id":null,"author_id":null,"include_bot_messages":false,"limit":10}"#,
+                false
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_tool_arguments(
+                "search_conversation_history",
+                r#"{"pattern":"test","regex":false,"channel_id":"2","author_id":null,"include_bot_messages":false,"limit":10}"#,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            validate_tool_arguments(
+                "get_channel_message_range",
+                r#"{"start_offset":0,"end_offset":10}"#,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            validate_tool_arguments(
+                "propose_guild_memory",
+                r#"{"kind":"wrong","title":"a","summary":"b","content":"c"}"#,
+                false
+            )
+            .is_err()
+        );
+    }
+
+    struct DiagramRunner {
+        exit_code: i32,
+    }
+
+    #[async_trait]
+    impl CodeRunner for DiagramRunner {
+        async fn execute(&self, plan: ExecutionPlan) -> Result<crate::runner::ExecutionResult> {
+            assert_eq!(plan.output_files, vec!["diagram.png"]);
+            assert_eq!(plan.files[0].path, "diagram.tex");
+            assert!(
+                plan.commands
+                    .iter()
+                    .any(|command| command.contains("--no-shell-escape"))
+            );
+            Ok(crate::runner::ExecutionResult {
+                exit_code: Some(self.exit_code),
+                timed_out: false,
+                output: "diagnostics".into(),
+                artifacts: if self.exit_code == 0 {
+                    vec![GeneratedArtifact {
+                        filename: "diagram.png".into(),
+                        bytes: b"\x89PNG\r\n\x1a\n".to_vec(),
+                    }]
+                } else {
+                    vec![]
+                },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn diagram_tool_collects_only_successful_images_and_limits_attachments() {
+        let mut artifacts = vec![];
+        let failed = render_diagram_tool(
+            Some(&DiagramRunner { exit_code: 1 }),
+            r#"{"source":"tex"}"#,
+            &mut artifacts,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed["ok"], false);
+        assert!(artifacts.is_empty());
+        for index in 1..=2 {
+            let result = render_diagram_tool(
+                Some(&DiagramRunner { exit_code: 0 }),
+                r#"{"source":"tex"}"#,
+                &mut artifacts,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["ok"], true);
+            assert_eq!(result["attachment"], format!("diagram-{index}.png"));
+        }
+        assert!(
+            render_diagram_tool(
+                Some(&DiagramRunner { exit_code: 0 }),
+                r#"{"source":"tex"}"#,
+                &mut artifacts
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(artifacts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reviewed_diagram_answer_passes_actual_image_to_reviewer() {
+        use crate::ai::{ContentPart, ModelResponse, ToolCall, ToolFunction};
+        struct DiagramModel {
+            calls: Mutex<usize>,
+        }
+        #[async_trait]
+        impl LanguageModel for DiagramModel {
+            async fn complete_response(&self, _request: ModelRequest) -> Result<ModelResponse> {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                Ok(if *calls == 1 {
+                    ModelResponse {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: "render_1".into(),
+                            kind: "function".into(),
+                            function: ToolFunction {
+                                name: "render_tikz_diagram".into(),
+                                arguments: r#"{"source":"tex"}"#.into(),
+                            },
+                        }],
+                    }
+                } else {
+                    ModelResponse {
+                        content: Some("図を添付します。".into()),
+                        tool_calls: vec![],
+                    }
+                })
+            }
+            async fn complete(&self, request: ModelRequest) -> Result<String> {
+                assert!(request.messages.iter().any(|message| match &message.content {
+                    PromptContent::Parts(parts) => parts.iter().any(|part| matches!(part, ContentPart::ImageUrl { image_url } if image_url.url.starts_with("data:image/png;base64,"))),
+                    _ => false,
+                }), "review must include the actual generated image");
+                Ok(r#"{"approved":true,"feedback":"ok","score":9}"#.into())
+            }
+        }
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let answer = generate_reviewed_answer(
+            &DiagramModel {
+                calls: Mutex::new(0),
+            },
+            &[],
+            &runtime_context(),
+            &[],
+            &database,
+            10,
+            Some(&DiagramRunner { exit_code: 0 }),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer.text, "図を添付します。");
+        assert_eq!(answer.artifacts.len(), 1);
+        assert_eq!(answer.artifacts[0].filename, "diagram-1.png");
+    }
+
+    #[test]
     fn reply_decision_validation_rejects_unsafe_values() {
         assert!(
             ReplyDecision {
@@ -1688,7 +2091,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(answer, "final answer");
+        assert_eq!(answer.text, "final answer");
     }
 
     #[tokio::test]
@@ -1992,16 +2395,20 @@ mod tests {
 
     #[tokio::test]
     async fn execute_code_in_sandbox_tool_invokes_code_runner() {
-        struct DummyRunner;
+        struct DummyRunner {
+            exit_code: i32,
+            timed_out: bool,
+        }
         #[async_trait]
         impl CodeRunner for DummyRunner {
             async fn execute(&self, plan: ExecutionPlan) -> Result<crate::runner::ExecutionResult> {
                 assert!(plan.execute);
                 assert_eq!(plan.files[0].path, "main.py");
                 Ok(crate::runner::ExecutionResult {
-                    exit_code: Some(0),
-                    timed_out: false,
+                    exit_code: Some(self.exit_code),
+                    timed_out: self.timed_out,
                     output: "hello world\n".to_owned(),
+                    artifacts: vec![],
                 })
             }
         }
@@ -2010,7 +2417,10 @@ mod tests {
         let model = StubModel {
             responses: Mutex::new(VecDeque::new()),
         };
-        let dummy_runner = DummyRunner;
+        let dummy_runner = DummyRunner {
+            exit_code: 0,
+            timed_out: false,
+        };
         let result = execute_local_tool(
             &model,
             &database,
@@ -2027,6 +2437,10 @@ mod tests {
         assert_eq!(result["ok"], true);
         assert_eq!(result["exit_code"], 0);
         assert_eq!(result["output"], "hello world\n");
+        for (exit_code, timed_out) in [(1, false), (0, true)] {
+            let failed = execute_local_tool(&model, &database, &runtime_context(), 10, &[], Some(&DummyRunner { exit_code, timed_out }), "execute_code_in_sandbox", r#"{"execute":true,"explanation":"run python","system_packages":[],"files":[{"path":"main.py","content":"print('hello world')"}],"commands":["python3 main.py"]}"#).await.unwrap();
+            assert_eq!(failed["ok"], false);
+        }
     }
 
     #[test]
@@ -2090,20 +2504,32 @@ mod tests {
     #[test]
     fn message_url_parts_extracts_channel_and_message_ids() {
         let url = "https://discord.com/channels/1535219312229490688/1535816143409909812/1536012339546165268";
-        let (channel, message) = message_url_parts(url).unwrap();
-        assert_eq!(channel, Some(1535816143409909812));
-        assert_eq!(message, Some(1536012339546165268));
+        let (guild, channel, message) = message_url_parts(url).unwrap();
+        assert_eq!(guild, 1535219312229490688);
+        assert_eq!(channel, 1535816143409909812);
+        assert_eq!(message, 1536012339546165268);
 
-        let (channel, message) = message_url_parts(url).unwrap();
-        assert_eq!(channel, Some(1535816143409909812));
-        assert_eq!(message, Some(1536012339546165268));
+        let (_, channel, message) = message_url_parts(url).unwrap();
+        assert_eq!(channel, 1535816143409909812);
+        assert_eq!(message, 1536012339546165268);
 
-        let (channel, message) = message_url_parts("https://discord.com/channels/1535219312229490688/1535816143409909812/1536012339546165268/").unwrap();
-        assert_eq!(channel, Some(1535816143409909812));
-        assert_eq!(message, Some(1536012339546165268));
+        let (_, channel, message) = message_url_parts("https://discord.com/channels/1535219312229490688/1535816143409909812/1536012339546165268/").unwrap();
+        assert_eq!(channel, 1535816143409909812);
+        assert_eq!(message, 1536012339546165268);
 
         assert!(message_url_parts("not a url").is_none());
         assert!(message_url_parts("https://discord.com/channels/abc/def/ghi").is_none());
+        for url in [
+            "https://evil.example/channels/1/2/3",
+            "http://discord.com/channels/1/2/3",
+            "https://discord.com/channels/@me/2/3",
+            "https://discord.com/channels/1/2/0",
+            "https://user@discord.com/channels/1/2/3",
+            "https://discord.com/channels/1/2/3?x=1",
+            "https://discord.com/channels/1/2",
+        ] {
+            assert!(message_url_parts(url).is_none(), "{url}");
+        }
     }
 
     #[tokio::test]

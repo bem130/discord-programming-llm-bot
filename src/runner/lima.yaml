@@ -46,6 +46,11 @@ provision:
         python3 \
         python3-pip \
         python3-venv \
+        texlive-luatex \
+        texlive-pictures \
+        texlive-latex-extra \
+        texlive-lang-japanese \
+        poppler-utils \
         sbcl \
         xz-utils
       apt-get clean

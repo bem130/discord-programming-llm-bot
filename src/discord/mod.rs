@@ -13,9 +13,9 @@ use anyhow::{Context as _, Result};
 use serenity::builder::GetMessages;
 use serenity::{
     all::{
-        Attachment, Channel, ChannelId, ChannelType, Context, CreateAllowedMentions, CreateMessage,
-        Emoji, EventHandler, GatewayIntents, GuildId, Interaction, Message, MessageId,
-        MessageUpdateEvent, ReactionType, Ready, RoleId,
+        Attachment, Channel, ChannelId, ChannelType, Context, CreateAllowedMentions,
+        CreateAttachment, CreateMessage, Emoji, EventHandler, GatewayIntents, GuildId, Interaction,
+        Message, MessageId, MessageUpdateEvent, ReactionType, Ready, RoleId,
     },
     async_trait,
     gateway::{ActivityData, ShardMessenger},
@@ -34,7 +34,7 @@ use crate::{
     delivery::split_message,
     model::{IncomingAttachment, IncomingMessage, RecentChannelActivity},
     runner::SharedCodeRunner,
-    tutor::{BotAction, ToolStatusSink, decide_action, generate_reviewed_answer},
+    tutor::{BotAction, GeneratedAnswer, ToolStatusSink, decide_action, generate_reviewed_answer},
 };
 
 const RECENT_CONTEXT_MESSAGE_LIMIT: u32 = 5;
@@ -80,7 +80,7 @@ struct PreparedConversationResponse {
     settings_channel_id: ChannelId,
     action: BotAction,
     custom_emojis: Vec<Emoji>,
-    answer: Option<String>,
+    answer: Option<GeneratedAnswer>,
 }
 
 #[derive(Clone, Copy)]
@@ -845,7 +845,10 @@ impl DiscordBot {
         .await
         .unwrap_or_else(|error| {
             tracing::error!(?error, "answer generation or review exhausted all retries");
-            GENERATION_FAILURE_MESSAGE.to_owned()
+            GeneratedAnswer {
+                text: GENERATION_FAILURE_MESSAGE.to_owned(),
+                artifacts: vec![],
+            }
         });
         Ok(PreparedConversationResponse {
             source,
@@ -932,9 +935,9 @@ impl DiscordBot {
         context: &Context,
         source_message: &Message,
         settings_channel_id: ChannelId,
-        answer: &str,
+        answer: &GeneratedAnswer,
     ) -> Result<()> {
-        let chunks = split_message(answer);
+        let chunks = split_message(&answer.text);
         if chunks.is_empty() {
             anyhow::bail!("reviewed answer was empty");
         }
@@ -948,6 +951,12 @@ impl DiscordBot {
                     .allowed_mentions(answer_allowed_mentions());
                 if index == 0 {
                     builder = builder.reference_message(source_message);
+                    for artifact in &answer.artifacts {
+                        builder = builder.add_file(CreateAttachment::bytes(
+                            artifact.bytes.clone(),
+                            artifact.filename.clone(),
+                        ));
+                    }
                 }
                 match source_message
                     .channel_id
@@ -1008,7 +1017,21 @@ impl DiscordBot {
                         is_bot: source_message.author.bot,
                         created_at: source_message.timestamp.to_string(),
                     }),
-                    attachments: vec![],
+                    attachments: if index == 0 {
+                        answer
+                            .artifacts
+                            .iter()
+                            .map(|artifact| IncomingAttachment {
+                                filename: artifact.filename.clone(),
+                                content_type: Some("image/png".into()),
+                                size_bytes: artifact.bytes.len() as u64,
+                                extracted_text: None,
+                                binary_data: Some(artifact.bytes.clone()),
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    },
                 })
                 .await
             {
