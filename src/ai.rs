@@ -790,15 +790,41 @@ fn append_reference_links(content: &mut String, annotations: &[Annotation]) {
         let Some(citation) = &annotation.url_citation else {
             continue;
         };
-        if links.iter().any(|(_, url)| url == &citation.url) {
+        let Ok(parsed) = reqwest::Url::parse(&citation.url) else {
+            continue;
+        };
+        let Some(host) = parsed.host_str() else {
+            continue;
+        };
+        if !matches!(parsed.scheme(), "http" | "https")
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || reference_host_is_local(host)
+        {
             continue;
         }
+        if links.iter().any(|(_, url)| url == parsed.as_str()) || content.contains(parsed.as_str())
+        {
+            continue;
+        }
+        let title = citation
+            .title
+            .as_deref()
+            .filter(|title| {
+                !title.trim().is_empty()
+                    && !title.to_ascii_lowercase().contains("localhost")
+                    && !title.contains("127.0.0.1")
+                    && !title.contains("[::1]")
+            })
+            .unwrap_or(host);
+        let title: String = title
+            .chars()
+            .take(200)
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
         links.push((
-            citation
-                .title
-                .clone()
-                .unwrap_or_else(|| citation.url.clone()),
-            citation.url.clone(),
+            title.replace('[', "\\[").replace(']', "\\]"),
+            parsed.to_string(),
         ));
     }
     if links.is_empty() {
@@ -810,9 +836,62 @@ fn append_reference_links(content: &mut String, annotations: &[Annotation]) {
     }
 }
 
+fn reference_host_is_local(host: &str) -> bool {
+    let host = host
+        .trim_end_matches('.')
+        .trim_matches(['[', ']'])
+        .to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.to_ipv4_mapped().is_some_and(|ip| {
+                    ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+                })
+        }
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn references_skip_internal_urls_duplicate_links_and_converter_titles() {
+        let annotations: Vec<Annotation> = serde_json::from_value(serde_json::json!([
+            {"url_citation": {"url": "http://localhost:8123/file.pdf", "title": "converted"}},
+            {"url_citation": {"url": "http://127.0.0.1:8123/file.pdf"}},
+            {"url_citation": {"url": "http://[::1]/file.pdf"}},
+            {"url_citation": {"url": "http://10.0.0.1/file.pdf"}},
+            {"url_citation": {"url": "file:///tmp/file.pdf"}},
+            {"url_citation": {"url": "https://docs.arduino.cc/pinout.pdf", "title": "localhost:8123"}},
+            {"url_citation": {"url": "https://docs.arduino.cc/pinout.pdf", "title": "duplicate"}}
+        ])).unwrap();
+        let mut content = "説明".to_string();
+        append_reference_links(&mut content, &annotations);
+        assert!(!content.contains("localhost"));
+        assert!(!content.contains("127.0.0.1"));
+        assert!(!content.contains("10.0.0.1"));
+        assert!(content.contains("[docs.arduino.cc](https://docs.arduino.cc/pinout.pdf)"));
+        assert_eq!(
+            content
+                .matches("https://docs.arduino.cc/pinout.pdf")
+                .count(),
+            1
+        );
+        let original = content.clone();
+        append_reference_links(&mut content, &annotations);
+        assert_eq!(content, original);
+    }
 
     #[test]
     fn tool_only_assistant_message_serializes_content_as_null() {

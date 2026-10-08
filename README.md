@@ -223,6 +223,7 @@ Discordのtyping表示は10秒で失効するため、Botは回答処理中に8�
 - `propose_guild_memory`: 明示的な依頼がなくても、長期的なプロジェクト判断・教訓・一次資料を検出して保存を提案
 - `execute_code_in_sandbox`: 隔離されたLima VM環境でコード（Rust, Python, C/C++, Go, JavaScript, TypeScript, Haskell, OCaml, Lean 4, Coq, Elm, Common Lisp, Lazy-K等）のコンパイル・検証・標準出力取得を実行
 - `render_tikz_diagram`: 完全なLaTeX文書を `source` に渡し、日本語対応のLuaLaTeXとPopplerでTikZ図をPNGへ変換。成功した画像を回答レビューへ渡し、承認後に本文の最初のメッセージへ添付
+- `clear_generated_diagrams`: この回答で生成した図をすべて添付対象から実際に除外。誤った図の再生成や、テキストのみの回答への切り替えに使用。利用者の元の添付は変更しない
 - `get_channel_recent_messages`: 指定したDiscordチャンネルの直近メッセージをタイムライン順に取得。channel_idまたはchannel_nameで指定し、別チャンネルの文脈把握に利用
 - `get_channel_message_range`: 指定したチャンネル（省略時は現在のチャンネル）の過去メッセージを、最新を1とした1始まりの順位範囲（start_offset〜end_offset）で取得
 - `get_messages_newer_than_message`: 指定したメッセージIDまたはメッセージURLより後に送信されたメッセージを古い順（時系列順）に取得。続きの確認や途中参加に利用
@@ -288,6 +289,8 @@ Discordで本文や添付が編集されると保存内容を置換し、本文�
 入力は64,000 bytes以内の完全なLaTeX文書です。`\documentclass[tikz,border=6pt]{standalone}`、`\usepackage{luatexja}`、`tikzpicture` を使います。PDFの先頭ページを長辺最大2,400 pixelsのPNGへ変換し、1画像4 MiB・1回答2画像までに制限します。shell escapeは無効です。依存ファイルの読み取りは許可しますが、VMのhomeは不可視で、書き込み先は実行用一時directoryに限定します。
 
 画像は実行終了後に固定名の通常ファイルだけを取得し、symlink・hardlink・特殊ファイル・上限超過を拒否します。画像自体をAIレビューへ渡し、承認が取れない場合は添付しません。コンパイル失敗・timeoutはtool結果の `ok=false` と診断として返り、モデルが修正できます。画像の送信は本文と同じretry経路を使用します。
+
+図付き回答がレビューで不承認の場合、最大2回、Web検索・ローカルtoolを使える回答生成へフィードバックを戻します。モデルは旧画像を `clear_generated_diagrams` で除外して修正図を再生成できます。各リクエストと再レビューには現在の添付一覧と実画像だけを渡し、過去の生成画像を送信対象へ戻しません。本文で「除外した」と述べるだけでは添付は消えません。最後まで承認されない回答は送信しません。自動追加の参考リンクでは内部URL、localhost由来の表示名、同じURLの重複を除去します。
 
 秘密情報やDiscord接続なしでの実VM検証（VMへの依存導入を伴います）:
 

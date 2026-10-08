@@ -9,8 +9,33 @@ use crate::ai::{
 };
 
 const REVIEW_PROMPT: &str = include_str!("../prompt/review.md");
-const MAX_REPAIR_ATTEMPTS: usize = 2;
+pub(crate) const MAX_REPAIR_ATTEMPTS: usize = 2;
 const MAX_TOOL_RESULT_CHARS: usize = 2_000;
+
+// One review step for callers that can repair the whole answer, including tool artifacts.
+pub(crate) async fn review_candidate(
+    model: &dyn LanguageModel,
+    guild_id: u64,
+    messages: &[PromptMessage],
+    candidate: &str,
+) -> Result<Option<String>> {
+    let issues = static_issues(candidate);
+    if !issues.is_empty() {
+        return Ok(Some(
+            issues
+                .iter()
+                .map(StaticIssue::instruction)
+                .collect::<Vec<_>>()
+                .join("; "),
+        ));
+    }
+    let verdict = semantic_review(model, guild_id, &review_context(messages), candidate).await?;
+    if verdict.approved {
+        return Ok(None);
+    }
+    warn!(score = verdict.score, feedback = %verdict.feedback, "semantic review rejected answer and attachments");
+    Ok(Some(verdict.feedback))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StaticIssue {
@@ -54,25 +79,6 @@ pub async fn review_response(
     original_messages: &[PromptMessage],
     generated: String,
 ) -> Result<String> {
-    review_response_impl(model, guild_id, original_messages, generated, false).await
-}
-
-pub async fn review_response_with_artifacts(
-    model: &dyn LanguageModel,
-    guild_id: u64,
-    original_messages: &[PromptMessage],
-    generated: String,
-) -> Result<String> {
-    review_response_impl(model, guild_id, original_messages, generated, true).await
-}
-
-async fn review_response_impl(
-    model: &dyn LanguageModel,
-    guild_id: u64,
-    original_messages: &[PromptMessage],
-    generated: String,
-    require_approval: bool,
-) -> Result<String> {
     let context = review_context(original_messages);
     let mut candidate = generated;
     let mut feedback_history: Vec<String> = Vec::new();
@@ -82,7 +88,6 @@ async fn review_response_impl(
         let issues = static_issues(&candidate);
         if !issues.is_empty() {
             if attempt == MAX_REPAIR_ATTEMPTS {
-                anyhow::ensure!(!require_approval, "diagram answer failed static review");
                 warn!(
                     issues = ?issues,
                     "static review still failing; delivering best effort candidate"
@@ -116,7 +121,6 @@ async fn review_response_impl(
             "semantic review rejected candidate"
         );
         if attempt == MAX_REPAIR_ATTEMPTS {
-            anyhow::ensure!(!require_approval, "diagram answer failed semantic review");
             let (score, best) = best_candidate.unwrap_or((0, candidate.clone()));
             warn!(
                 score,
@@ -460,26 +464,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_diagrams_when_semantic_review_exhausted() {
+    async fn single_step_review_returns_feedback_for_artifact_aware_repair() {
         let model = StubModel {
             responses: Mutex::new(VecDeque::from([
-                r#"{"approved":false,"feedback":"wrong diagram","score":3}"#.into(),
-                "candidate B".into(),
-                r#"{"approved":false,"feedback":"wrong diagram","score":3}"#.into(),
-                "candidate C".into(),
                 r#"{"approved":false,"feedback":"wrong diagram","score":3}"#.into(),
             ])),
             requests: Mutex::new(Vec::new()),
         };
-        assert!(
-            review_response_with_artifacts(
-                &model,
-                123,
-                &[PromptMessage::user("draw")],
-                "candidate A".into()
-            )
-            .await
-            .is_err()
+        assert_eq!(
+            review_candidate(&model, 123, &[PromptMessage::user("draw")], "candidate A")
+                .await
+                .unwrap(),
+            Some("wrong diagram".into())
         );
     }
 
