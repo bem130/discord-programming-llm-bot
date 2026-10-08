@@ -425,6 +425,7 @@ fn truncate_history_text(text: String, max_chars: usize, label: &str) -> String 
 fn prompt_message_chars(message: &PromptMessage) -> usize {
     let content_chars = match &message.content {
         crate::ai::PromptContent::Text(text) => text.chars().count(),
+        crate::ai::PromptContent::Null => 0,
         crate::ai::PromptContent::Parts(parts) => {
             serde_json::to_string(parts).map_or(0, |serialized| serialized.chars().count())
         }
@@ -1529,6 +1530,7 @@ mod tests {
         assert_eq!(
             match &messages[0].content {
                 PromptContent::Text(text) => text.as_str(),
+                PromptContent::Null => panic!("unexpected null content"),
                 PromptContent::Parts(_) => panic!("unexpected multipart request"),
             },
             "original request"

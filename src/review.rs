@@ -294,7 +294,7 @@ mod tests {
     fn content_text(message: &PromptMessage) -> Option<String> {
         match &message.content {
             PromptContent::Text(text) => Some(text.clone()),
-            PromptContent::Parts(_) => None,
+            PromptContent::Parts(_) | PromptContent::Null => None,
         }
     }
 

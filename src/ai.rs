@@ -60,7 +60,9 @@ impl PromptMessage {
     pub fn assistant_tool_calls(content: Option<String>, tool_calls: Vec<ToolCall>) -> Self {
         Self {
             role: PromptRole::Assistant,
-            content: PromptContent::Text(content.unwrap_or_default()),
+            content: content
+                .map(PromptContent::Text)
+                .unwrap_or(PromptContent::Null),
             tool_calls: Some(tool_calls),
             tool_call_id: None,
         }
@@ -81,6 +83,7 @@ impl PromptMessage {
 pub enum PromptContent {
     Text(String),
     Parts(Vec<ContentPart>),
+    Null,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -302,6 +305,28 @@ impl LanguageModel for OpenRouterClient {
     }
 
     async fn complete_response(&self, request: ModelRequest) -> Result<ModelResponse> {
+        match self.complete_response_once(request.clone()).await {
+            Err(error)
+                if request.web_search
+                    && error
+                        .downcast_ref::<OpenRouterHttpError>()
+                        .is_some_and(is_server_tool_failure) =>
+            {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "OpenRouter web search server tool failed; retrying without web search"
+                );
+                let mut fallback = request;
+                fallback.web_search = false;
+                self.complete_response_once(fallback).await
+            }
+            result => result,
+        }
+    }
+}
+
+impl OpenRouterClient {
+    async fn complete_response_once(&self, request: ModelRequest) -> Result<ModelResponse> {
         let heals_structured_response = request.response_schema.is_some();
         let requires_parameter_support =
             heals_structured_response || !request.tools.is_empty() || request.reasoning.is_some();
@@ -372,7 +397,17 @@ impl LanguageModel for OpenRouterClient {
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_secs);
         if !status.is_success() {
-            return Err(openrouter_status_error(status, retry_after));
+            let body = response.text().await.unwrap_or_default();
+            let message = openrouter_error_message(&body);
+            if status == StatusCode::BAD_REQUEST {
+                tracing::warn!(
+                    shape = message_sequence_shape(&request.messages),
+                    provider = openrouter_provider_name(&body).unwrap_or_else(|| "unknown".into()),
+                    message = %message,
+                    "OpenRouter 400 rejected request message sequence"
+                );
+            }
+            return Err(openrouter_status_error(status, retry_after, message));
         }
 
         let completion: ChatCompletionResponse = response
@@ -551,13 +586,75 @@ pub async fn complete_json_with_retry<T: DeserializeOwned>(
     Err(last_error.context("structured model operation produced no error detail")?)
 }
 
-fn openrouter_status_error(status: StatusCode, retry_after: Option<Duration>) -> anyhow::Error {
-    // Provider error bodies can echo request data. Do not include them in logs.
+fn openrouter_status_error(
+    status: StatusCode,
+    retry_after: Option<Duration>,
+    message: String,
+) -> anyhow::Error {
     OpenRouterHttpError {
         status,
         retry_after,
+        message,
     }
     .into()
+}
+
+fn is_server_tool_failure(error: &OpenRouterHttpError) -> bool {
+    error.message.contains("Server tool request failed")
+}
+
+fn openrouter_provider_name(body: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(body).ok()?;
+    parsed
+        .pointer("/error/metadata/provider_name")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn openrouter_error_message(body: &str) -> String {
+    const MAX_INSPECTED_BODY_CHARS: usize = 4_000;
+    const MAX_MESSAGE_CHARS: usize = 300;
+
+    let body = body.trim();
+    if body.chars().count() > MAX_INSPECTED_BODY_CHARS {
+        return "response body too large to inspect".to_string();
+    }
+    let parsed = serde_json::from_str::<Value>(body).ok();
+    let extracted = parsed
+        .as_ref()
+        .and_then(|value| value.pointer("/error/message"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| body.to_string());
+    extracted.chars().take(MAX_MESSAGE_CHARS).collect()
+}
+
+fn message_sequence_shape(messages: &[PromptMessage]) -> String {
+    messages
+        .iter()
+        .map(|message| {
+            let role = match message.role {
+                PromptRole::System => "system",
+                PromptRole::User => "user",
+                PromptRole::Assistant => "assistant",
+                PromptRole::Tool => "tool",
+            };
+            let content = match &message.content {
+                PromptContent::Text(text) if text.is_empty() => "text(empty)",
+                PromptContent::Text(_) => "text",
+                PromptContent::Parts(_) => "parts",
+                PromptContent::Null => "null",
+            };
+            format!(
+                "{role}:{content}:tc={}:tid={}",
+                message.tool_calls.as_ref().map_or(0, Vec::len),
+                message.tool_call_id.is_some()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 pub fn model_retry_delay(error: &anyhow::Error, fallback: Duration) -> Option<Duration> {
@@ -588,10 +685,11 @@ pub fn model_error_is_global_fatal(error: &anyhow::Error) -> bool {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("OpenRouter returned HTTP {status}")]
+#[error("OpenRouter returned HTTP {status}: {message}")]
 struct OpenRouterHttpError {
     status: StatusCode,
     retry_after: Option<Duration>,
+    message: String,
 }
 
 #[derive(Serialize)]
@@ -679,6 +777,29 @@ fn append_reference_links(content: &mut String, annotations: &[Annotation]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_only_assistant_message_serializes_content_as_null() {
+        let tool_call = ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: ToolFunction {
+                name: "execute_code_in_sandbox".into(),
+                arguments: r#"{"code":"print(1)"}"#.into(),
+            },
+        };
+
+        let tool_only = PromptMessage::assistant_tool_calls(None, vec![tool_call.clone()]);
+        let payload = serde_json::to_value(&tool_only).unwrap();
+        assert_eq!(payload["role"], "assistant");
+        assert_eq!(payload["content"], serde_json::Value::Null);
+        assert_eq!(payload["tool_calls"][0]["id"], "call_1");
+
+        let with_text =
+            PromptMessage::assistant_tool_calls(Some("thinking".into()), vec![tool_call]);
+        let payload = serde_json::to_value(&with_text).unwrap();
+        assert_eq!(payload["content"], "thinking");
+    }
 
     #[test]
     fn fallback_model_order_is_preserved() {
@@ -795,26 +916,109 @@ mod tests {
 
     #[test]
     fn retry_advice_respects_status_and_short_retry_after() {
-        let unauthorized = openrouter_status_error(StatusCode::UNAUTHORIZED, None);
+        let unauthorized =
+            openrouter_status_error(StatusCode::UNAUTHORIZED, None, "unauthorized".into());
         assert_eq!(
             model_retry_delay(&unauthorized, Duration::from_millis(200)),
             None
         );
         assert!(model_error_is_global_fatal(&unauthorized));
 
-        let short_limit =
-            openrouter_status_error(StatusCode::TOO_MANY_REQUESTS, Some(Duration::from_secs(1)));
+        let short_limit = openrouter_status_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(Duration::from_secs(1)),
+            "rate limited".into(),
+        );
         assert!(!model_error_is_global_fatal(&short_limit));
         assert_eq!(
             model_retry_delay(&short_limit, Duration::from_millis(200)),
             Some(Duration::from_secs(1))
         );
 
-        let long_limit =
-            openrouter_status_error(StatusCode::TOO_MANY_REQUESTS, Some(Duration::from_secs(60)));
+        let long_limit = openrouter_status_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(Duration::from_secs(60)),
+            "rate limited".into(),
+        );
         assert_eq!(
             model_retry_delay(&long_limit, Duration::from_millis(200)),
             None
+        );
+    }
+
+    #[test]
+    fn extracts_openrouter_error_message_and_truncates_oversized_bodies() {
+        assert_eq!(
+            openrouter_error_message(
+                r#"{"error":{"message":"Invalid message format","code":400}}"#
+            ),
+            "Invalid message format"
+        );
+        assert_eq!(
+            openrouter_error_message("plain text body"),
+            "plain text body"
+        );
+        assert_eq!(
+            openrouter_error_message(&"x".repeat(5_000)),
+            "response body too large to inspect"
+        );
+        assert_eq!(
+            openrouter_error_message(&format!(
+                r#"{{"error":{{"message":"{}"}}}}"#,
+                "y".repeat(1_000)
+            ))
+            .chars()
+            .count(),
+            300
+        );
+    }
+
+    #[test]
+    fn extracts_provider_name_from_error_metadata() {
+        let body = r#"{"error":{"message":"Provider returned error","metadata":{"provider_name":"DeepSeek"}}}"#;
+        assert_eq!(openrouter_provider_name(body).as_deref(), Some("DeepSeek"));
+        assert_eq!(openrouter_provider_name("not json"), None);
+        assert_eq!(
+            openrouter_provider_name(r#"{"error":{"message":"boom"}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn detects_server_tool_failures() {
+        assert!(is_server_tool_failure(&OpenRouterHttpError {
+            status: StatusCode::BAD_REQUEST,
+            retry_after: None,
+            message: "Server tool request failed".into(),
+        }));
+        assert!(!is_server_tool_failure(&OpenRouterHttpError {
+            status: StatusCode::BAD_REQUEST,
+            retry_after: None,
+            message: "Invalid message format".into(),
+        }));
+    }
+
+    #[test]
+    fn message_sequence_shape_marks_roles_and_structure() {
+        let messages = vec![
+            PromptMessage::system("system prompt"),
+            PromptMessage::assistant_tool_calls(
+                None,
+                vec![ToolCall {
+                    id: "call_1".into(),
+                    kind: "function".into(),
+                    function: ToolFunction {
+                        name: "execute_code_in_sandbox".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+            ),
+            PromptMessage::tool_result("call_1", "output"),
+        ];
+
+        assert_eq!(
+            message_sequence_shape(&messages),
+            "system:text:tc=0:tid=false | assistant:null:tc=1:tid=false | tool:text:tc=0:tid=true"
         );
     }
 }
