@@ -45,6 +45,11 @@ pub trait ToolStatusSink: Send + Sync {
     fn idle(&self);
 }
 
+#[async_trait::async_trait]
+pub trait MessageHistoryReader: Send + Sync {
+    async fn message(&self, channel_id: u64, message_id: u64) -> Result<ContextMessage>;
+}
+
 #[derive(Debug, Default)]
 pub struct GeneratedAnswer {
     pub text: String,
@@ -266,6 +271,32 @@ pub async fn generate_reviewed_answer(
     runner: Option<&dyn CodeRunner>,
     status_sink: Option<&dyn ToolStatusSink>,
 ) -> Result<GeneratedAnswer> {
+    generate_reviewed_answer_with_history(
+        model,
+        context,
+        runtime_context,
+        memories,
+        database,
+        source_message_id,
+        runner,
+        status_sink,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn generate_reviewed_answer_with_history(
+    model: &dyn LanguageModel,
+    context: &[ContextMessage],
+    runtime_context: &RuntimeContext,
+    memories: &[GuildMemory],
+    database: &Database,
+    source_message_id: u64,
+    runner: Option<&dyn CodeRunner>,
+    status_sink: Option<&dyn ToolStatusSink>,
+    history: Option<&dyn MessageHistoryReader>,
+) -> Result<GeneratedAnswer> {
     let result = with_answer_deadline(
         generate_reviewed_answer_inner(
             model,
@@ -276,6 +307,7 @@ pub async fn generate_reviewed_answer(
             source_message_id,
             runner,
             status_sink,
+            history,
         ),
         ANSWER_DEADLINE,
     )
@@ -296,6 +328,7 @@ async fn generate_reviewed_answer_inner(
     source_message_id: u64,
     runner: Option<&dyn CodeRunner>,
     status_sink: Option<&dyn ToolStatusSink>,
+    history: Option<&dyn MessageHistoryReader>,
 ) -> Result<GeneratedAnswer> {
     let mut budget = AnswerBudget::default();
     let mut messages = conversation_prompt(context, runtime_context, memories);
@@ -308,6 +341,7 @@ async fn generate_reviewed_answer_inner(
         &mut messages,
         runner,
         status_sink,
+        history,
         vec![],
         &mut budget,
     )
@@ -361,6 +395,7 @@ async fn generate_reviewed_answer_inner(
             &mut messages,
             runner,
             status_sink,
+            history,
             generated.artifacts,
             &mut budget,
         )
@@ -413,12 +448,14 @@ async fn generate_with_tools(
     messages: &mut Vec<PromptMessage>,
     runner: Option<&dyn CodeRunner>,
     status_sink: Option<&dyn ToolStatusSink>,
+    history: Option<&dyn MessageHistoryReader>,
     initial_artifacts: Vec<GeneratedArtifact>,
     budget: &mut AnswerBudget,
 ) -> Result<GeneratedAnswer> {
     let mut artifacts = initial_artifacts;
     let base_message_count = messages.len();
     let mut tool_rounds: Vec<String> = Vec::new();
+    let mut history_context = context.to_vec();
     while budget.rounds < MAX_LOCAL_TOOL_ROUNDS
         && !budget.stop_tools
         && budget.calls < MAX_LOCAL_TOOL_CALLS
@@ -481,6 +518,7 @@ async fn generate_with_tools(
             response.content,
             historical_tool_calls,
         ));
+        let mut retrieved_messages = Vec::new();
         for tool_call in response.tool_calls {
             let tool_name = tool_call.function.name.clone();
             if let Some(sink) = status_sink {
@@ -489,6 +527,22 @@ async fn generate_with_tools(
             let reserved = budget.reserve(&tool_name, &tool_call.function.arguments);
             let result = if let Err(error) = reserved {
                 Err(error)
+            } else if tool_name == "get_message_details" {
+                match get_message_details(
+                    database,
+                    runtime_context,
+                    history,
+                    &tool_call.function.arguments,
+                )
+                .await
+                {
+                    Ok(message) => {
+                        let value = json!({"ok": true, "messages": context_messages_to_json(std::slice::from_ref(&message))});
+                        retrieved_messages.push(message);
+                        Ok(value)
+                    }
+                    Err(error) => Err(error),
+                }
             } else if tool_name == "render_tikz_diagram" {
                 render_diagram_tool(runner, &tool_call.function.arguments, &mut artifacts).await
             } else if tool_name == "clear_generated_diagrams" {
@@ -535,6 +589,22 @@ async fn generate_with_tools(
                 tool_call.id,
                 truncate_history_text(content, MAX_TOOL_RESULT_HISTORY_CHARS, "ツール結果"),
             ));
+        }
+
+        // Keep all tool results adjacent to their calls before adding multimodal user data.
+        if !retrieved_messages.is_empty() {
+            for message in retrieved_messages {
+                history_context.retain(|existing| existing.message_id != message.message_id);
+                history_context.push(message);
+            }
+            crate::context::limit_multimodal_attachments(&mut history_context);
+            // Rebuild one shared media budget across current and fetched messages.
+            for message in messages.iter_mut() {
+                if let crate::ai::PromptContent::Parts(parts) = &mut message.content {
+                    parts.retain(|part| matches!(part, crate::ai::ContentPart::Text { .. }));
+                }
+            }
+            messages.push(crate::context::context_data_message(&history_context));
         }
 
         compact_tool_transcript(messages, base_message_count);
@@ -680,6 +750,10 @@ async fn execute_local_tool(
 ) -> Result<serde_json::Value> {
     validate_tool_arguments(name, arguments, runner.is_some())?;
     match name {
+        "get_message_details" => {
+            let message = get_message_details(database, runtime_context, None, arguments).await?;
+            Ok(json!({"ok": true, "messages": context_messages_to_json(&[message])}))
+        }
         "search_conversation_history" => {
             let args: ConversationSearchArguments =
                 serde_json::from_str(arguments).context("invalid conversation search arguments")?;
@@ -1244,6 +1318,7 @@ fn local_tool_definitions(with_runner: bool) -> Vec<serde_json::Value> {
             }
         }),
         conversation_search_tool(),
+        message_details_tool(),
         memory_details_tool(),
         memory_candidate_tool(),
         channel_recent_messages_tool(),
@@ -1379,6 +1454,74 @@ fn conversation_search_tool() -> serde_json::Value {
     })
 }
 
+fn message_details_tool() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "get_message_details",
+            "description": "許可済みチャンネルの指定メッセージ自身を本文・返信元・添付付きで取得する。検索結果の全文、リプライ元、過去の画像・PDF・コード添付を読む際に使う。message_url、またはchannel_idとmessage_idを正確に指定する。画像・PDF本体は取得可能な場合に後続のコンテキストとして渡される。添付本文がない場合は読めたと主張しない。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_url": {"type": "string"},
+                    "channel_id": {"type": "integer"},
+                    "message_id": {"type": "integer"}
+                },
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+async fn get_message_details(
+    database: &Database,
+    runtime_context: &RuntimeContext,
+    history: Option<&dyn MessageHistoryReader>,
+    arguments: &str,
+) -> Result<ContextMessage> {
+    validate_tool_arguments("get_message_details", arguments, false)?;
+    #[derive(Deserialize)]
+    struct Args {
+        message_url: Option<String>,
+        channel_id: Option<u64>,
+        message_id: Option<u64>,
+    }
+    let args: Args = serde_json::from_str(arguments)?;
+    let (channel_id, message_id) = if let Some(url) = args.message_url {
+        let (guild, channel, message) =
+            message_url_parts(&url).context("expected an HTTPS Discord guild message URL")?;
+        anyhow::ensure!(
+            guild == runtime_context.server.id,
+            "message URL belongs to another server"
+        );
+        anyhow::ensure!(
+            args.channel_id.is_none_or(|id| id == channel)
+                && args.message_id.is_none_or(|id| id == message),
+            "message URL conflicts with explicit IDs"
+        );
+        (channel, message)
+    } else {
+        (
+            args.channel_id
+                .context("channel_id is required with message_id")?,
+            args.message_id
+                .context("message_id or message_url is required")?,
+        )
+    };
+    anyhow::ensure!(
+        channel_id != 0 && message_id != 0,
+        "Discord IDs must be nonzero"
+    );
+    if let Some(history) = history {
+        return history.message(channel_id, message_id).await;
+    }
+    database
+        .message_context_by_id(runtime_context.server.id, message_id)
+        .await?
+        .filter(|message| message.channel_id == channel_id)
+        .context("message is unavailable or its channel does not allow AI access")
+}
+
 fn memory_details_tool() -> serde_json::Value {
     json!({
         "type": "function",
@@ -1511,6 +1654,7 @@ fn context_messages_to_json(messages: &[ContextMessage]) -> Vec<serde_json::Valu
         .map(|m| {
             json!({
                 "message_id": m.message_id,
+                "channel_id": m.channel_id,
                 "author_id": m.author_id,
                 "author_name": m.author_name,
                 "content": m.content,
@@ -1518,7 +1662,13 @@ fn context_messages_to_json(messages: &[ContextMessage]) -> Vec<serde_json::Valu
                 "created_at": m.created_at,
                 "reply_to": m.reply_to,
                 "linked_messages": m.linked_messages,
-                "attachment_count": m.attachments.len()
+                "attachment_count": m.attachments.len(),
+                "attachments": m.attachments.iter().map(|attachment| json!({
+                    "filename": attachment.filename,
+                    "content_type": attachment.content_type,
+                    "extracted_text": attachment.extracted_text,
+                    "has_binary_data": attachment.binary_data.is_some()
+                })).collect::<Vec<_>>()
             })
         })
         .collect()
@@ -2503,6 +2653,152 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn message_details_rejects_wrong_scope_and_exposes_attachment_text() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let runtime = runtime_context();
+        database
+            .set_channel_mode(runtime.server.id, 2, ChannelMode::ReadOnly, 3)
+            .await
+            .unwrap();
+        database
+            .record_message(&crate::model::IncomingMessage {
+                discord_message_id: 10,
+                guild_id: runtime.server.id,
+                channel_id: 2,
+                channel_name: None,
+                settings_channel_id: 2,
+                author_id: 3,
+                author_name: "tester".into(),
+                content: "attached code".into(),
+                is_bot: false,
+                created_at: "2026-10-01T00:00:00Z".into(),
+                referenced_message_id: None,
+                referenced_message: None,
+                attachments: vec![crate::model::IncomingAttachment {
+                    filename: "main.rs".into(),
+                    content_type: Some("text/plain".into()),
+                    size_bytes: 12,
+                    extracted_text: Some("fn main() {}".into()),
+                    binary_data: None,
+                }],
+            })
+            .await
+            .unwrap();
+        let arguments = json!({"channel_id":2,"message_id":10}).to_string();
+        let message = get_message_details(&database, &runtime, None, &arguments)
+            .await
+            .unwrap();
+        let value = context_messages_to_json(&[message]);
+        assert_eq!(value[0]["channel_id"], 2);
+        assert_eq!(value[0]["attachments"][0]["extracted_text"], "fn main() {}");
+        for arguments in [
+            json!({"channel_id":4,"message_id":10}),
+            json!({"message_url":format!("https://discord.com/channels/{}/2/10", runtime.server.id + 1)}),
+            json!({"message_url":format!("https://discord.com/channels/{}/2/10", runtime.server.id),"message_id":11}),
+            json!({"channel_id":2,"message_id":0}),
+        ] {
+            assert!(
+                get_message_details(&database, &runtime, None, &arguments.to_string())
+                    .await
+                    .is_err()
+            );
+        }
+        database
+            .set_channel_mode(runtime.server.id, 2, ChannelMode::Off, 3)
+            .await
+            .unwrap();
+        assert!(
+            get_message_details(&database, &runtime, None, &arguments)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn fetched_history_images_and_pdfs_reach_the_next_model_request_after_tool_results() {
+        struct History;
+        #[async_trait]
+        impl MessageHistoryReader for History {
+            async fn message(&self, channel: u64, id: u64) -> Result<ContextMessage> {
+                assert_eq!((channel, id), (2, 10));
+                let mut message = context_message(id);
+                message.attachments = vec![
+                    crate::model::ContextAttachment {
+                        filename: "image.png".into(),
+                        content_type: Some("image/png".into()),
+                        extracted_text: None,
+                        binary_data: Some(vec![1, 2, 3]),
+                    },
+                    crate::model::ContextAttachment {
+                        filename: "notes.pdf".into(),
+                        content_type: Some("application/pdf".into()),
+                        extracted_text: None,
+                        binary_data: Some(vec![4, 5, 6]),
+                    },
+                ];
+                Ok(message)
+            }
+        }
+        struct Model(Mutex<usize>);
+        #[async_trait]
+        impl LanguageModel for Model {
+            async fn complete(&self, _: ModelRequest) -> Result<String> {
+                unreachable!()
+            }
+            async fn complete_response(
+                &self,
+                request: ModelRequest,
+            ) -> Result<crate::ai::ModelResponse> {
+                let mut calls = self.0.lock().unwrap();
+                *calls += 1;
+                if *calls == 1 {
+                    Ok(crate::ai::ModelResponse {
+                        content: None,
+                        tool_calls: vec![crate::ai::ToolCall {
+                            id: "detail".into(),
+                            kind: "function".into(),
+                            function: crate::ai::ToolFunction {
+                                name: "get_message_details".into(),
+                                arguments: json!({"channel_id":2,"message_id":10}).to_string(),
+                            },
+                        }],
+                    })
+                } else {
+                    let result_index = request
+                        .messages
+                        .iter()
+                        .position(|message| message.tool_call_id.as_deref() == Some("detail"))
+                        .unwrap();
+                    let image_index = request.messages.iter().position(|message| matches!(&message.content, PromptContent::Parts(parts) if parts.iter().any(|part| matches!(part, crate::ai::ContentPart::ImageUrl { .. })) && parts.iter().any(|part| matches!(part, crate::ai::ContentPart::File { .. })))).unwrap();
+                    assert!(result_index < image_index);
+                    Ok(crate::ai::ModelResponse {
+                        content: Some("read attachments".into()),
+                        tool_calls: vec![],
+                    })
+                }
+            }
+        }
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let mut messages = vec![PromptMessage::user("read the old attachment")];
+        let answer = generate_with_tools(
+            &Model(Mutex::new(0)),
+            &database,
+            &runtime_context(),
+            1,
+            &[],
+            &mut messages,
+            None,
+            None,
+            Some(&History),
+            vec![],
+            &mut AnswerBudget::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer.text, "read attachments");
+    }
+
     #[test]
     fn recent_range_maps_newest_based_offsets_onto_chronological_messages() {
         let messages: Vec<_> = (1..=10).map(context_message).collect();
@@ -2645,6 +2941,7 @@ mod tests {
             0,
             &[],
             &mut messages,
+            None,
             None,
             None,
             vec![],

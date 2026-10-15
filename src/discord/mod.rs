@@ -15,7 +15,7 @@ use serenity::{
     all::{
         Attachment, Channel, ChannelId, ChannelType, Context, CreateAllowedMentions,
         CreateAttachment, CreateMessage, Emoji, EventHandler, GatewayIntents, GuildId, Interaction,
-        Message, MessageId, MessageUpdateEvent, ReactionType, Ready, RoleId,
+        Message, MessageId, MessageType, MessageUpdateEvent, ReactionType, Ready, RoleId,
     },
     async_trait,
     gateway::{ActivityData, ShardMessenger},
@@ -34,7 +34,10 @@ use crate::{
     delivery::split_message,
     model::{IncomingAttachment, IncomingMessage, RecentChannelActivity},
     runner::SharedCodeRunner,
-    tutor::{BotAction, GeneratedAnswer, ToolStatusSink, decide_action, generate_reviewed_answer},
+    tutor::{
+        BotAction, GeneratedAnswer, MessageHistoryReader, ToolStatusSink, decide_action,
+        generate_reviewed_answer_with_history,
+    },
 };
 
 const RECENT_CONTEXT_MESSAGE_LIMIT: u32 = 5;
@@ -571,37 +574,27 @@ impl DiscordBot {
             return Ok(());
         }
 
-        let (referenced_message_id, referenced_message) =
-            if let Some(ref_msg) = &message.referenced_message {
-                (
-                    Some(ref_msg.id.get()),
-                    Some(crate::model::ReferencedMessage {
-                        message_id: ref_msg.id.get(),
-                        channel_id: ref_msg.channel_id.get(),
-                        author_id: ref_msg.author.id.get(),
-                        author_name: ref_msg
-                            .author
-                            .global_name
-                            .clone()
-                            .unwrap_or_else(|| ref_msg.author.name.clone()),
-                        content: ref_msg.content.clone(),
-                        is_bot: ref_msg.author.bot,
-                        created_at: ref_msg.timestamp.to_string(),
-                    }),
-                )
-            } else if let Some(msg_ref) = &message.message_reference {
-                if let Some(msg_id) = msg_ref.message_id {
-                    let chan_id = msg_ref.channel_id.get();
-                    let ref_msg = self
-                        .resolve_referenced_message(context, chan_id, msg_id.get())
-                        .await;
-                    (Some(msg_id.get()), Some(ref_msg))
-                } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            };
+        let reference = message
+            .message_reference
+            .as_ref()
+            .and_then(|reference| {
+                reference
+                    .message_id
+                    .map(|id| (reference.channel_id.get(), id.get()))
+            })
+            .or_else(|| {
+                message
+                    .referenced_message
+                    .as_ref()
+                    .map(|message| (message.channel_id.get(), message.id.get()))
+            });
+        let referenced_message_id = reference.map(|(_, id)| id);
+        let referenced_message = match reference {
+            Some((channel, id)) => {
+                Some(self.resolve_referenced_message(context, channel, id).await)
+            }
+            None => None,
+        };
 
         let channel_name = match message.channel_id.to_channel(&context.http).await {
             Ok(Channel::Guild(channel)) => Some(channel.name),
@@ -626,7 +619,7 @@ impl DiscordBot {
             })
             .await?;
 
-        if mode == crate::model::ChannelMode::ReadOnly {
+        if mode == crate::model::ChannelMode::ReadOnly || !can_reply_to(message.kind) {
             return Ok(());
         }
         let bot_user_id = self.bot_user_id.load(Ordering::Relaxed);
@@ -763,6 +756,29 @@ impl DiscordBot {
                 }
             }
         }
+        // Include the full parent message, including attachments, rather than only its text summary.
+        let mut referenced_context = Vec::new();
+        for message in current_channel_context.iter().rev().take(5) {
+            if let Some(reference) = &message.reply_to
+                && !current_channel_context
+                    .iter()
+                    .any(|message| message.message_id == reference.message_id)
+                && !referenced_context
+                    .iter()
+                    .any(|message: &crate::model::ContextMessage| {
+                        message.message_id == reference.message_id
+                    })
+                && let Some(parent) = self
+                    .database
+                    .message_context_by_id(self.guild_id.get(), reference.message_id)
+                    .await?
+            {
+                referenced_context.push(parent);
+            }
+        }
+        referenced_context.reverse();
+        referenced_context.extend(current_channel_context);
+        let current_channel_context = referenced_context;
         let recent_active_channels = self
             .database
             .recent_active_channels(
@@ -832,7 +848,7 @@ impl DiscordBot {
         let memories = self.database.active_memories(self.guild_id.get()).await?;
         let status_sink =
             ToolStatusSinkGuard::new(context.shard.clone(), Arc::clone(&self.tool_activity));
-        let answer = generate_reviewed_answer(
+        let answer = generate_reviewed_answer_with_history(
             self.model.as_ref(),
             &current_channel_context,
             &runtime_context,
@@ -841,6 +857,11 @@ impl DiscordBot {
             source.id.get(),
             self.runner.as_deref(),
             Some(&status_sink),
+            Some(&DiscordHistoryReader {
+                database: &self.database,
+                http: &context.http,
+                guild_id: self.guild_id,
+            }),
         )
         .await
         .unwrap_or_else(|error| {
@@ -943,53 +964,14 @@ impl DiscordBot {
         }
 
         for (index, chunk) in chunks.into_iter().enumerate() {
-            let mut sent = None;
-            let mut last_error = None;
-            for attempt in 1..=DISCORD_SEND_ATTEMPTS {
-                let mut builder = CreateMessage::new()
-                    .content(chunk.clone())
-                    .allowed_mentions(answer_allowed_mentions());
-                if index == 0 {
-                    builder = builder.reference_message(source_message);
-                    for artifact in &answer.artifacts {
-                        builder = builder.add_file(CreateAttachment::bytes(
-                            artifact.bytes.clone(),
-                            artifact.filename.clone(),
-                        ));
-                    }
-                }
-                match source_message
-                    .channel_id
-                    .send_message(&context.http, builder)
-                    .await
-                {
-                    Ok(message) => {
-                        sent = Some(message);
-                        break;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            ?error,
-                            attempt,
-                            max_attempts = DISCORD_SEND_ATTEMPTS,
-                            chunk_index = index,
-                            "failed to send reviewed answer chunk"
-                        );
-                        last_error = Some(error);
-                        if attempt < DISCORD_SEND_ATTEMPTS {
-                            tokio::time::sleep(DISCORD_SEND_RETRY_DELAY).await;
-                        }
-                    }
-                }
-            }
-            let sent = sent.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "failed to send reviewed answer after retries: {}",
-                    last_error
-                        .map(|error| error.to_string())
-                        .unwrap_or_else(|| "unknown Discord error".to_owned())
-                )
-            })?;
+            let (sent, reply) = send_answer_chunk(
+                &context.http,
+                source_message,
+                &chunk,
+                index,
+                &answer.artifacts,
+            )
+            .await?;
             if let Err(error) = self
                 .database
                 .record_message(&IncomingMessage {
@@ -1003,8 +985,8 @@ impl DiscordBot {
                     content: sent.content,
                     is_bot: true,
                     created_at: sent.timestamp.to_string(),
-                    referenced_message_id: (index == 0).then_some(source_message.id.get()),
-                    referenced_message: (index == 0).then(|| crate::model::ReferencedMessage {
+                    referenced_message_id: reply.then_some(source_message.id.get()),
+                    referenced_message: reply.then(|| crate::model::ReferencedMessage {
                         message_id: source_message.id.get(),
                         channel_id: source_message.channel_id.get(),
                         author_id: source_message.author.id.get(),
@@ -1051,50 +1033,122 @@ impl DiscordBot {
         channel_id: u64,
         message_id: u64,
     ) -> crate::model::ReferencedMessage {
-        if let Ok(Some(cached)) = self
-            .database
-            .get_allowed_message_by_discord_id(self.guild_id.get(), message_id)
-            .await
-            && cached.channel_id == channel_id
+        match (DiscordHistoryReader {
+            database: &self.database,
+            http: &context.http,
+            guild_id: self.guild_id,
+        })
+        .message(channel_id, message_id)
+        .await
         {
-            return cached;
-        }
-
-        let requested_channel = ChannelId::new(channel_id);
-        let settings_channel_id = match configuration_channel_id(context, requested_channel).await {
-            Ok(channel_id) => channel_id,
-            Err(_) => return unavailable_referenced_message(channel_id, message_id),
-        };
-        let allowed = self
-            .database
-            .channel_mode(self.guild_id.get(), settings_channel_id.get())
-            .await
-            .is_ok_and(crate::model::ChannelMode::stores_messages);
-        if !allowed {
-            return unavailable_referenced_message(channel_id, message_id);
-        }
-
-        match context
-            .http
-            .get_message(requested_channel, MessageId::new(message_id))
-            .await
-        {
-            Ok(message)
-                if message.guild_id == Some(self.guild_id)
-                    && message.channel_id == requested_channel =>
-            {
-                crate::model::ReferencedMessage {
-                    message_id: message.id.get(),
-                    channel_id: message.channel_id.get(),
-                    author_id: message.author.id.get(),
-                    author_name: message.author.global_name.unwrap_or(message.author.name),
-                    content: message.content,
-                    is_bot: message.author.bot,
-                    created_at: message.timestamp.to_string(),
-                }
+            Ok(message) => crate::model::ReferencedMessage {
+                message_id: message.message_id,
+                channel_id: message.channel_id,
+                author_id: message.author_id,
+                author_name: message.author_name,
+                content: message.content,
+                is_bot: message.is_bot,
+                created_at: message.created_at,
+            },
+            Err(error) => {
+                tracing::debug!(%error, channel_id, message_id, "referenced message unavailable");
+                unavailable_referenced_message(channel_id, message_id)
             }
-            _ => unavailable_referenced_message(channel_id, message_id),
         }
+    }
+}
+
+struct DiscordHistoryReader<'a> {
+    database: &'a Database,
+    http: &'a Http,
+    guild_id: GuildId,
+}
+
+#[async_trait]
+impl MessageHistoryReader for DiscordHistoryReader<'_> {
+    async fn message(
+        &self,
+        channel_id: u64,
+        message_id: u64,
+    ) -> Result<crate::model::ContextMessage> {
+        let channel_id = ChannelId::new(channel_id);
+        let Channel::Guild(channel) = channel_id.to_channel(self.http).await? else {
+            anyhow::bail!("message channel is not a guild channel");
+        };
+        anyhow::ensure!(
+            channel.guild_id == self.guild_id,
+            "message channel belongs to another server"
+        );
+        let settings_channel_id =
+            inherited_settings_channel_id(channel.id, channel.parent_id, channel.kind);
+        anyhow::ensure!(
+            self.database
+                .channel_mode(self.guild_id.get(), settings_channel_id.get())
+                .await?
+                .stores_messages(),
+            "message channel does not allow AI access"
+        );
+        let message = channel_id
+            .message(self.http, MessageId::new(message_id))
+            .await?;
+        // REST message objects can omit guild_id; the channel above establishes the guild.
+        anyhow::ensure!(
+            message.channel_id == channel_id
+                && message.guild_id.is_none_or(|guild| guild == self.guild_id),
+            "message belongs to another channel or server"
+        );
+        let attachments = extract_attachments(&message.attachments).await;
+        self.database
+            .record_message(&IncomingMessage {
+                discord_message_id: message.id.get(),
+                guild_id: self.guild_id.get(),
+                channel_id: channel_id.get(),
+                channel_name: Some(channel.name),
+                settings_channel_id: settings_channel_id.get(),
+                author_id: message.author.id.get(),
+                author_name: message
+                    .author
+                    .global_name
+                    .clone()
+                    .unwrap_or_else(|| message.author.name.clone()),
+                content: message.content.clone(),
+                is_bot: message.author.bot,
+                created_at: message.timestamp.to_string(),
+                referenced_message_id: message
+                    .message_reference
+                    .as_ref()
+                    .and_then(|reference| reference.message_id.map(|id| id.get())),
+                referenced_message: None,
+                attachments: attachments.clone(),
+            })
+            .await?;
+        // Refresh old backfill rows too: their image/PDF bytes were deliberately omitted.
+        self.database
+            .update_message(
+                message.id.get(),
+                Some(&message.content),
+                Some(&attachments),
+                message
+                    .edited_timestamp
+                    .map(|timestamp| timestamp.to_string())
+                    .as_deref(),
+            )
+            .await?;
+        let mut result = self
+            .database
+            .message_context_by_id(self.guild_id.get(), message_id)
+            .await?
+            .context("message is unavailable or its channel no longer allows AI access")?;
+        if result.reply_to.is_none()
+            && let Some(reference) = &message.message_reference
+            && let Some(parent_id) = reference.message_id
+        {
+            result.reply_to = Some(unavailable_referenced_message(
+                reference.channel_id.get(),
+                parent_id.get(),
+            ));
+        }
+        Ok(result)
     }
 }
 
@@ -1123,6 +1177,97 @@ fn conversation_batch_ready_at(first: Instant, latest: Instant) -> Instant {
 
 fn answer_allowed_mentions() -> CreateAllowedMentions {
     CreateAllowedMentions::new().replied_user(true)
+}
+
+async fn send_answer_chunk(
+    http: &Http,
+    source_message: &Message,
+    chunk: &str,
+    chunk_index: usize,
+    artifacts: &[crate::runner::GeneratedArtifact],
+) -> Result<(Message, bool)> {
+    let first = chunk_index == 0;
+    let mut sent = None;
+    let mut last_error = None;
+    let mut reply = first && can_reply_to(source_message.kind);
+    for attempt in 1..=DISCORD_SEND_ATTEMPTS {
+        let mut builder = CreateMessage::new()
+            .content(chunk)
+            .allowed_mentions(answer_allowed_mentions());
+        if reply {
+            builder = builder.reference_message(source_message);
+        }
+        if first {
+            for artifact in artifacts {
+                builder = builder.add_file(CreateAttachment::bytes(
+                    artifact.bytes.clone(),
+                    artifact.filename.clone(),
+                ));
+            }
+        }
+        match source_message.channel_id.send_message(http, builder).await {
+            Ok(message) => {
+                sent = Some(message);
+                break;
+            }
+            Err(error) => {
+                let drop_reference = reply && rejected_reply_reference(&error);
+                tracing::warn!(
+                    ?error,
+                    attempt,
+                    max_attempts = DISCORD_SEND_ATTEMPTS,
+                    chunk_index = chunk_index,
+                    "failed to send reviewed answer chunk"
+                );
+                last_error = Some(error);
+                if drop_reference {
+                    reply = false;
+                } else if !retryable_send_error(last_error.as_ref().expect("send error")) {
+                    break;
+                }
+                if attempt < DISCORD_SEND_ATTEMPTS {
+                    tokio::time::sleep(DISCORD_SEND_RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+    let sent = sent.ok_or_else(|| {
+        anyhow::anyhow!(
+            "failed to send reviewed answer after retries: {}",
+            last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "unknown Discord error".to_owned())
+        )
+    })?;
+    Ok((sent, reply))
+}
+
+fn can_reply_to(kind: MessageType) -> bool {
+    matches!(
+        kind,
+        MessageType::Regular
+            | MessageType::InlineReply
+            | MessageType::ChatInputCommand
+            | MessageType::ContextMenuCommand
+    )
+}
+
+fn rejected_reply_reference(error: &serenity::Error) -> bool {
+    matches!(error, serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(response))
+        if response.error.code == 10008 || (response.error.code == 50035 && response.error.errors.iter().any(|error|
+            error.path == "message_reference" && error.code == "REPLIES_CANNOT_REPLY_TO_SYSTEM_MESSAGE")))
+}
+
+fn retryable_send_error(error: &serenity::Error) -> bool {
+    match error {
+        serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(response)) => {
+            response.status_code.is_server_error() || response.status_code.as_u16() == 429
+        }
+        serenity::Error::Http(serenity::http::HttpError::Request(_)) | serenity::Error::Io(_) => {
+            true
+        }
+        _ => false,
+    }
 }
 
 struct TypingGuard {
@@ -1205,6 +1350,7 @@ async fn extract_attachments_with_binary(
     include_binary: bool,
 ) -> Vec<IncomingAttachment> {
     let mut extracted = Vec::with_capacity(attachments.len());
+    let mut remaining_bytes = MAX_MULTIMODAL_ATTACHMENT_BYTES as usize;
     for attachment in attachments {
         let is_text = is_text_attachment(attachment);
         let is_multimodal = is_multimodal_attachment(attachment);
@@ -1212,9 +1358,18 @@ async fn extract_attachments_with_binary(
             || (include_binary
                 && is_multimodal
                 && attachment.size <= MAX_MULTIMODAL_ATTACHMENT_BYTES);
-        let bytes = if should_download {
-            match attachment.download().await {
-                Ok(bytes) => Some(bytes),
+        let limit = if is_multimodal && include_binary {
+            MAX_MULTIMODAL_ATTACHMENT_BYTES as usize
+        } else {
+            MAX_TEXT_ATTACHMENT_BYTES as usize
+        }
+        .min(remaining_bytes);
+        let bytes = if should_download && attachment.size as usize <= limit {
+            match download_attachment(attachment, limit).await {
+                Ok(bytes) => {
+                    remaining_bytes -= bytes.len();
+                    Some(bytes)
+                }
                 Err(error) => {
                     tracing::warn!(
                         ?error,
@@ -1227,7 +1382,7 @@ async fn extract_attachments_with_binary(
         } else {
             None
         };
-        let extracted_text = if is_text {
+        let extracted_text = if is_text && attachment.size <= MAX_TEXT_ATTACHMENT_BYTES {
             bytes
                 .as_ref()
                 .and_then(|bytes| String::from_utf8(bytes.clone()).ok())
@@ -1247,6 +1402,64 @@ async fn extract_attachments_with_binary(
         });
     }
     extracted
+}
+
+async fn download_attachment(attachment: &Attachment, limit: usize) -> Result<Vec<u8>> {
+    let url = reqwest::Url::parse(&attachment.url)?;
+    anyhow::ensure!(
+        url.scheme() == "https"
+            && matches!(
+                url.host_str(),
+                Some("cdn.discordapp.com" | "media.discordapp.net")
+            )
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none(),
+        "unsupported attachment URL"
+    );
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("attachment HTTP client")
+    });
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("attachment download failed"))?;
+    read_attachment_response(response, limit).await
+}
+
+async fn read_attachment_response(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        response.status().is_success(),
+        "attachment HTTP request was rejected"
+    );
+    anyhow::ensure!(
+        response
+            .content_length()
+            .is_none_or(|size| size <= limit as u64),
+        "attachment exceeds byte limit"
+    );
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| anyhow::anyhow!("attachment body could not be read"))?
+    {
+        anyhow::ensure!(
+            chunk.len() <= limit.saturating_sub(bytes.len()),
+            "attachment exceeds byte limit"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 async fn sync_allowed_history(http: &Http, database: &Database, guild_id: GuildId) -> Result<()> {
@@ -1375,18 +1588,54 @@ async fn add_archived_thread_pages(
     targets: &mut HashMap<u64, HistoryTarget>,
     private: bool,
 ) -> Result<()> {
-    let mut before = None;
+    let mut before: Option<String> = None;
     loop {
         let threads = if private {
             parent_id
-                .get_joined_archived_private_threads(http, before, Some(100))
+                .get_joined_archived_private_threads(
+                    http,
+                    before.as_deref().map(str::parse).transpose()?,
+                    Some(100),
+                )
                 .await?
         } else {
-            parent_id
-                .get_archived_public_threads(http, before, Some(100))
-                .await?
+            let mut params = vec![("limit", "100".to_owned())];
+            if let Some(before) = &before {
+                params.push(("before", before.clone()));
+            }
+            // Serenity 0.12's convenience method accepts a snowflake, but Discord requires
+            // an ISO8601 archive timestamp for public threads.
+            http.fire::<serenity::all::ThreadsData>(
+                serenity::http::Request::new(
+                    serenity::http::Route::ChannelArchivedPublicThreads {
+                        channel_id: parent_id,
+                    },
+                    serenity::http::LightMethod::Get,
+                )
+                .params(Some(params)),
+            )
+            .await?
         };
-        let oldest = threads.threads.iter().map(|thread| thread.id.get()).min();
+        let oldest = if private {
+            threads
+                .threads
+                .iter()
+                .map(|thread| thread.id.get())
+                .min()
+                .map(|id| id.to_string())
+        } else {
+            threads
+                .threads
+                .iter()
+                .filter_map(|thread| {
+                    thread
+                        .thread_metadata
+                        .as_ref()
+                        .map(|metadata| metadata.archive_timestamp)
+                })
+                .min()
+                .map(|timestamp| timestamp.to_string())
+        };
         for thread in threads.threads {
             targets.insert(
                 thread.id.get(),
@@ -1707,6 +1956,251 @@ fn unavailable_referenced_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mock_http(
+        responses: Vec<(u16, serde_json::Value)>,
+    ) -> (
+        Http,
+        std::thread::JoinHandle<Vec<(String, serde_json::Value)>>,
+    ) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, response) in responses {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "mock request timed out"
+                            );
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("mock accept failed: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let header_end = loop {
+                    let mut buffer = [0; 4096];
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert!(read > 0);
+                    bytes.extend_from_slice(&buffer[..read]);
+                    if let Some(index) = bytes.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        break index + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let path = headers
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_owned();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                while bytes.len() < header_end + length {
+                    let mut buffer = [0; 4096];
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert!(read > 0);
+                    bytes.extend_from_slice(&buffer[..read]);
+                }
+                let body = if length == 0 {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap()
+                };
+                requests.push((path, body));
+                let body = response.to_string();
+                write!(stream, "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let http = serenity::http::HttpBuilder::new("dummy-test-token")
+            .client(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .unwrap(),
+            )
+            .proxy(format!("http://{address}"))
+            .ratelimiter_disabled(true)
+            .build();
+        (http, server)
+    }
+
+    fn test_message() -> Message {
+        let mut message = Message::default();
+        message.id = MessageId::new(10);
+        message.channel_id = ChannelId::new(2);
+        message.author.id = serenity::all::UserId::new(3);
+        message.content = "history message".into();
+        message
+    }
+
+    #[tokio::test]
+    async fn system_message_reply_rejection_retries_without_reference() {
+        let source = test_message();
+        let (http, server) = mock_http(vec![
+            (
+                400,
+                serde_json::json!({"code":50035,"message":"Invalid Form Body","errors":{"message_reference":{"_errors":[{"code":"REPLIES_CANNOT_REPLY_TO_SYSTEM_MESSAGE","message":"Cannot reply to a system message"}]}}}),
+            ),
+            (200, serde_json::to_value(&source).unwrap()),
+        ]);
+        let (_, reply) = send_answer_chunk(&http, &source, "answer", 0, &[])
+            .await
+            .unwrap();
+        assert!(!reply);
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0].1["message_reference"]["message_id"], "10");
+        assert!(requests[1].1.get("message_reference").is_none());
+        assert_eq!(requests[1].1["content"], "answer");
+    }
+
+    #[tokio::test]
+    async fn known_system_messages_are_sent_without_a_reply_and_bad_requests_are_not_retried() {
+        let mut source = test_message();
+        source.kind = MessageType::ThreadStarterMessage;
+        let (http, server) = mock_http(vec![(200, serde_json::to_value(&source).unwrap())]);
+        assert!(
+            !send_answer_chunk(&http, &source, "answer", 0, &[])
+                .await
+                .unwrap()
+                .1
+        );
+        assert!(
+            server.join().unwrap()[0]
+                .1
+                .get("message_reference")
+                .is_none()
+        );
+        let (http, server) = mock_http(vec![(
+            403,
+            serde_json::json!({"code":50013,"message":"Missing Permissions"}),
+        )]);
+        assert!(
+            send_answer_chunk(&http, &source, "answer", 0, &[])
+                .await
+                .is_err()
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+        for kind in [
+            MessageType::Regular,
+            MessageType::InlineReply,
+            MessageType::ChatInputCommand,
+            MessageType::ContextMenuCommand,
+        ] {
+            assert!(can_reply_to(kind));
+        }
+        for kind in [
+            MessageType::PinsAdd,
+            MessageType::MemberJoin,
+            MessageType::ThreadCreated,
+            MessageType::Unknown(255),
+        ] {
+            assert!(!can_reply_to(kind));
+        }
+    }
+
+    #[tokio::test]
+    async fn public_archived_threads_use_archive_time_and_not_creation_id_for_paging() {
+        let thread = |id: u64, timestamp: &str| {
+            serde_json::json!({
+                "id": id.to_string(), "guild_id":"1", "parent_id":"2", "type":11, "name":"archived",
+                "thread_metadata":{"archived":true,"auto_archive_duration":60,"archive_timestamp":timestamp,"locked":false}
+            })
+        };
+        let (http, server) = mock_http(vec![
+            (
+                200,
+                serde_json::json!({"threads":[thread(300, "2026-10-01T00:00:00Z"), thread(100, "2026-10-02T00:00:00Z")],"members":[],"has_more":true}),
+            ),
+            (
+                200,
+                serde_json::json!({"threads":[thread(200, "2026-09-01T00:00:00Z")],"members":[],"has_more":false}),
+            ),
+        ]);
+        let mut targets = HashMap::new();
+        add_archived_thread_pages(&http, ChannelId::new(2), &mut targets, false)
+            .await
+            .unwrap();
+        assert_eq!(targets.len(), 3);
+        let requests = server.join().unwrap();
+        let url = reqwest::Url::parse(&format!("http://localhost{}", requests[1].0)).unwrap();
+        let before = url
+            .query_pairs()
+            .find(|(key, _)| key == "before")
+            .unwrap()
+            .1
+            .into_owned();
+        assert!(before.starts_with("2026-10-01"));
+    }
+
+    #[tokio::test]
+    async fn live_history_checks_guild_and_mode_and_accepts_rest_messages_without_guild_id() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        database
+            .set_channel_mode(1, 2, crate::model::ChannelMode::ReadOnly, 3)
+            .await
+            .unwrap();
+        let channel = serde_json::json!({"id":"2","guild_id":"1","type":0,"name":"history"});
+        let mut message = test_message();
+        message.guild_id = None;
+        let (http, server) = mock_http(vec![
+            (200, channel.clone()),
+            (200, serde_json::to_value(&message).unwrap()),
+        ]);
+        let reader = DiscordHistoryReader {
+            database: &database,
+            http: &http,
+            guild_id: GuildId::new(1),
+        };
+        assert_eq!(
+            reader.message(2, 10).await.unwrap().content,
+            "history message"
+        );
+        assert_eq!(server.join().unwrap().len(), 2);
+        database
+            .set_channel_mode(1, 2, crate::model::ChannelMode::Off, 3)
+            .await
+            .unwrap();
+        let (http, server) = mock_http(vec![(200, channel)]);
+        let reader = DiscordHistoryReader {
+            database: &database,
+            http: &http,
+            guild_id: GuildId::new(1),
+        };
+        assert!(reader.message(2, 10).await.is_err());
+        assert_eq!(server.join().unwrap().len(), 1);
+        let (http, server) = mock_http(vec![(
+            200,
+            serde_json::json!({"id":"2","guild_id":"9","type":0,"name":"foreign"}),
+        )]);
+        let reader = DiscordHistoryReader {
+            database: &database,
+            http: &http,
+            guild_id: GuildId::new(1),
+        };
+        assert!(reader.message(2, 10).await.is_err());
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
 
     #[test]
     fn resolves_standard_emoji_shortcode_to_unicode() {

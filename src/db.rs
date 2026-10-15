@@ -489,6 +489,13 @@ impl Database {
                AND c.mode != 'off'
             LEFT JOIN messages AS ref
                 ON ref.discord_message_id = m.referenced_message_id
+               AND ref.guild_id = m.guild_id
+               AND EXISTS (
+                   SELECT 1 FROM channel_settings AS rc
+                   WHERE rc.guild_id = ref.guild_id
+                     AND rc.channel_id = COALESCE(ref.settings_channel_id, ref.channel_id)
+                     AND rc.mode != 'off'
+               )
             WHERE m.guild_id = ? AND m.channel_id = ?
             ORDER BY CAST(m.discord_message_id AS INTEGER) DESC
             LIMIT ?
@@ -504,6 +511,46 @@ impl Database {
         let mut messages = self.context_messages_from_rows(rows).await?;
         messages.reverse();
         Ok(messages)
+    }
+
+    pub async fn message_context_by_id(
+        &self,
+        guild_id: u64,
+        message_id: u64,
+    ) -> Result<Option<ContextMessage>> {
+        let Some(message) = self
+            .get_allowed_message_by_discord_id(guild_id, message_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        // Use the same permission-filtered context loader as every history page.
+        let rows = sqlx::query(
+            r#"SELECT m.id, m.discord_message_id, m.channel_id, m.author_id, m.author_name,
+                      m.content, m.is_bot, m.created_at, m.referenced_message_id,
+                      ref.discord_message_id AS ref_discord_message_id,
+                      ref.channel_id AS ref_channel_id, ref.author_id AS ref_author_id,
+                      ref.author_name AS ref_author_name, ref.content AS ref_content,
+                      ref.is_bot AS ref_is_bot, ref.created_at AS ref_created_at
+               FROM messages AS m
+               INNER JOIN channel_settings AS c
+                 ON c.guild_id = m.guild_id
+                AND c.channel_id = COALESCE(m.settings_channel_id, m.channel_id) AND c.mode != 'off'
+               LEFT JOIN messages AS ref
+                 ON ref.discord_message_id = m.referenced_message_id
+                AND ref.guild_id = m.guild_id
+                AND EXISTS (SELECT 1 FROM channel_settings AS rc
+                            WHERE rc.guild_id = ref.guild_id
+                              AND rc.channel_id = COALESCE(ref.settings_channel_id, ref.channel_id)
+                              AND rc.mode != 'off')
+               WHERE m.guild_id = ? AND m.channel_id = ? AND m.discord_message_id = ?"#,
+        )
+        .bind(guild_id.to_string())
+        .bind(message.channel_id.to_string())
+        .bind(message_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(self.context_messages_from_rows(rows).await?.pop())
     }
 
     async fn context_messages_from_rows(
@@ -595,6 +642,13 @@ impl Database {
                AND c.mode != 'off'
             LEFT JOIN messages AS ref
                 ON ref.discord_message_id = m.referenced_message_id
+               AND ref.guild_id = m.guild_id
+               AND EXISTS (
+                   SELECT 1 FROM channel_settings AS rc
+                   WHERE rc.guild_id = ref.guild_id
+                     AND rc.channel_id = COALESCE(ref.settings_channel_id, ref.channel_id)
+                     AND rc.mode != 'off'
+               )
             WHERE m.guild_id = ? AND m.channel_id = ?
               AND CAST(m.discord_message_id AS INTEGER) > ?
             ORDER BY CAST(m.discord_message_id AS INTEGER) ASC
@@ -642,6 +696,13 @@ impl Database {
                AND c.mode != 'off'
             LEFT JOIN messages AS ref
                 ON ref.discord_message_id = m.referenced_message_id
+               AND ref.guild_id = m.guild_id
+               AND EXISTS (
+                   SELECT 1 FROM channel_settings AS rc
+                   WHERE rc.guild_id = ref.guild_id
+                     AND rc.channel_id = COALESCE(ref.settings_channel_id, ref.channel_id)
+                     AND rc.mode != 'off'
+               )
             WHERE m.guild_id = ? AND m.channel_id = ?
               AND (
                   strftime('%Y-%m-%dT%H:%M:%fZ', m.created_at) >
@@ -720,25 +781,29 @@ impl Database {
             .collect()
     }
 
-    /// Finds a channel ID by name within a guild (case-insensitive, returns first match).
+    /// Finds a channel ID by name within a guild, rejecting ambiguous names.
     pub async fn find_channel_id_by_name(
         &self,
         guild_id: u64,
         channel_name: &str,
     ) -> Result<Option<u64>> {
-        let row = sqlx::query_scalar::<_, String>(
+        let rows = sqlx::query_scalar::<_, String>(
             r#"
             SELECT channel_id FROM guild_channels
             WHERE guild_id = ? AND LOWER(channel_name) = LOWER(?)
-            LIMIT 1
+            LIMIT 2
             "#,
         )
         .bind(guild_id.to_string())
         .bind(channel_name)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await
         .context("failed to find channel by name")?;
-        row.map(parse_id).transpose()
+        anyhow::ensure!(
+            rows.len() <= 1,
+            "channel name is ambiguous; use the exact channel_id"
+        );
+        rows.into_iter().next().map(parse_id).transpose()
     }
 
     pub async fn channel_exists(&self, guild_id: u64, channel_id: u64) -> Result<bool> {
@@ -1148,6 +1213,125 @@ mod tests {
                 binary_data: None,
             }],
         }
+    }
+
+    #[tokio::test]
+    async fn every_history_loader_filters_reply_parents_by_guild_and_effective_mode() {
+        let database = test_database().await;
+        database
+            .set_channel_mode(1, 2, ChannelMode::ReadOnly, 3)
+            .await
+            .unwrap();
+        database
+            .set_channel_mode(1, 4, ChannelMode::ReadOnly, 3)
+            .await
+            .unwrap();
+        let mut parent = concurrent_test_message(10);
+        parent.channel_id = 5; // Thread inherits channel 4.
+        parent.settings_channel_id = 4;
+        database.record_message(&parent).await.unwrap();
+        let mut child = concurrent_test_message(20);
+        child.referenced_message_id = Some(10);
+        database.record_message(&child).await.unwrap();
+        assert_eq!(
+            database
+                .message_context_by_id(1, 20)
+                .await
+                .unwrap()
+                .unwrap()
+                .reply_to
+                .unwrap()
+                .message_id,
+            10
+        );
+        assert_eq!(
+            database
+                .message_context_by_id(1, 10)
+                .await
+                .unwrap()
+                .unwrap()
+                .attachments[0]
+                .extracted_text
+                .as_deref(),
+            Some("fn main() {}")
+        );
+        database
+            .set_channel_mode(1, 4, ChannelMode::Off, 3)
+            .await
+            .unwrap();
+        for messages in [
+            database.recent_channel_context(1, 2, 20).await.unwrap(),
+            database
+                .messages_newer_than_message(1, 2, 1, 20)
+                .await
+                .unwrap(),
+            database
+                .messages_newer_than_datetime(1, 2, "2026-01-01T00:00:00Z", None, 20)
+                .await
+                .unwrap(),
+            vec![
+                database
+                    .message_context_by_id(1, 20)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            ],
+        ] {
+            assert_eq!(messages.len(), 1);
+            assert!(messages[0].reply_to.is_none());
+        }
+        assert!(
+            database
+                .message_context_by_id(1, 10)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            database
+                .search_messages(1, 2, "message 10", false, None, None, false, 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Even an allowed parent in a different guild cannot be joined.
+        let mut foreign = concurrent_test_message(30);
+        foreign.guild_id = 9;
+        database
+            .set_channel_mode(9, 2, ChannelMode::ReadOnly, 3)
+            .await
+            .unwrap();
+        database.record_message(&foreign).await.unwrap();
+        let mut child = concurrent_test_message(40);
+        child.referenced_message_id = Some(30);
+        database.record_message(&child).await.unwrap();
+        assert!(
+            database
+                .message_context_by_id(1, 40)
+                .await
+                .unwrap()
+                .unwrap()
+                .reply_to
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_channel_names_require_an_exact_id() {
+        let database = test_database().await;
+        for channel in [2, 4] {
+            let mut message = concurrent_test_message(channel);
+            message.channel_id = channel;
+            database.record_message(&message).await.unwrap();
+        }
+        assert!(
+            database
+                .find_channel_id_by_name(1, "history")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

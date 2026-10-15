@@ -307,6 +307,24 @@ fn recent_multimodal_attachments(context: &[ContextMessage]) -> Vec<(u64, &Conte
     selected
 }
 
+pub fn limit_multimodal_attachments(context: &mut [ContextMessage]) {
+    let mut count = 0;
+    let mut bytes = 0;
+    for message in context.iter_mut().rev() {
+        for attachment in message.attachments.iter_mut().rev() {
+            let Some(data) = &attachment.binary_data else {
+                continue;
+            };
+            if count >= MAX_MULTIMODAL_ATTACHMENTS || data.len() > MAX_MULTIMODAL_BYTES - bytes {
+                attachment.binary_data = None;
+            } else {
+                count += 1;
+                bytes += data.len();
+            }
+        }
+    }
+}
+
 fn is_supported_image(content_type: &str) -> bool {
     matches!(
         content_type,

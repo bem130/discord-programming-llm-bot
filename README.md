@@ -208,7 +208,7 @@ cargo run --release
 
 thread内のメッセージはthread IDではなく親チャンネルのモードで判定します。会話の保存先情報と返信先は実際のthreadのままなので、親チャンネルが `mention` または `auto` ならthread内でも同じ動作をします。thread内で `/ai channel` や `/ai status target:` を実行した場合も親チャンネルを対象にします。
 
-Botが起動すると、`read_only`、`mention`、`auto` に設定されたテキスト・ニュースチャンネルと、取得できるactive/archived threadの履歴をDiscord APIから同期します。初回は取得可能な過去メッセージを全ページ取得し、次回以降は保存済みの最新Discord message IDより後だけを取得するため、Bot停止中に投稿されたメッセージも会話検索とコンテキストへ含まれます。`/ai channel`で保存モードを有効にした場合も、そのチャンネルの同期を要求します。BotにDiscord側の閲覧・履歴閲覧権限がないチャンネルはAPIが返す範囲だけが対象で、チャンネル単位の失敗で他チャンネルの同期は止まりません。履歴同期ではテキスト・コード添付の本文を抽出し、画像・PDFなどのバイナリは新着イベント時だけ保存します。
+Botが起動すると、`read_only`、`mention`、`auto` に設定されたテキスト・ニュースチャンネルと、取得できるactive/archived threadの履歴をDiscord APIから同期します。初回は取得可能な過去メッセージを全ページ取得し、次回以降は保存済みの最新Discord message IDより後だけを取得するため、Bot停止中に投稿されたメッセージも会話検索とコンテキストへ含まれます。`/ai channel`で保存モードを有効にした場合も、そのチャンネルの同期を要求します。BotにDiscord側の閲覧・履歴閲覧権限がないチャンネルはAPIが返す範囲だけが対象で、チャンネル単位の失敗で他チャンネルの同期は止まりません。履歴同期ではテキスト・コード添付の本文を抽出し、画像・PDFなどのバイナリは新着イベント時に保存し、過去の添付は `get_message_details` で必要なメッセージを指定した際にDiscordから取得・保存します。
 
 Discordのtyping表示は10秒で失効するため、Botは回答処理中に8秒間隔で更新します。最初の回答chunkを送信し終えるまで表示を維持し、成功・失敗のどちらでも更新taskを停止します。
 
@@ -219,17 +219,20 @@ Discordのtyping表示は10秒で失効するため、Botは回答処理中に8�
 通常回答モデルには、次のローカルtoolを渡します。
 
 - `search_conversation_history`: 保存済みの全会話本文と抽出済み添付テキストを検索。リテラル検索とRust正規表現、channel/user絞り込みに対応し、各結果へチャンネル名・現在チャンネル判定・日時・メッセージURLを付与
+- `get_message_details`: メッセージURL、または正確なチャンネルIDとメッセージIDで、そのメッセージ自身の全文・返信元・添付を取得。Discord側の閲覧権限、対象サーバー、スレッド親を含むAIアクセス設定を検証し、過去の画像・PDFは取得できた本体を次のAIリクエストへ渡します。削除済み・権限不足・上限超過・ダウンロード失敗時には読めたと扱いません。
 - `get_guild_memory_details`: promptに毎回渡す短い索引から、必要なメモリ詳細だけを取得
 - `propose_guild_memory`: 明示的な依頼がなくても、長期的なプロジェクト判断・教訓・一次資料を検出して保存を提案
 - `execute_code_in_sandbox`: 隔離されたLima VM環境でコード（Rust, Python, C/C++, Go, JavaScript, TypeScript, Haskell, OCaml, Lean 4, Coq, Elm, Common Lisp, Lazy-K等）のコンパイル・検証・標準出力取得を実行
 - `render_tikz_diagram`: 完全なLaTeX文書を `source` に渡し、日本語対応のLuaLaTeXとPopplerでTikZ図をPNGへ変換。成功した画像を回答レビューへ渡し、承認後に本文の最初のメッセージへ添付
 - `clear_generated_diagrams`: 図なし回答へ切り替える場合に、生成した図をすべて添付対象から実際に除外。修正図の生成には描画toolの `replace` を使用。利用者の元の添付は変更しない
-- `get_channel_recent_messages`: 指定したDiscordチャンネルの直近メッセージをタイムライン順に取得。channel_idまたはchannel_nameで指定し、別チャンネルの文脈把握に利用
+- `get_channel_recent_messages`: 指定したDiscordチャンネルの直近メッセージをタイムライン順に取得。channel_idまたはchannel_nameで指定し、別チャンネルの文脈把握に利用。添付の名前・種類・抽出済み本文・バイナリ保存有無も返します。画像・PDF本体は `get_message_details` で取得します
 - `get_channel_message_range`: 指定したチャンネル（省略時は現在のチャンネル）の過去メッセージを、最新を1とした1始まりの順位範囲（start_offset〜end_offset）で取得
 - `get_messages_newer_than_message`: 指定したメッセージIDまたはメッセージURLより後に送信されたメッセージを古い順（時系列順）に取得。続きの確認や途中参加に利用
 - `get_messages_newer_than_datetime`: 指定した日付時刻より後に送信されたメッセージを古い順（時系列順）に取得。前回確認以降の新着把握に利用。タイムゾーン省略はUTC扱い、日本時間（JST=UTC+9）で指定する場合は末尾に `+09:00` を付ける（例: `2026-08-09T23:00:00+09:00`）。ページング時は直前結果の `created_at` と `message_id` をそれぞれ `datetime` と `after_message_id` に渡す
 - `explain_compiler_error`: `rustc --explain`を使ってRustエラーコード（E0382等）の公式解説をローカルで取得
 - `format_and_lint_code`: `rustfmt`（Rust）または`python -m py_compile`（Python）をホスト上で直接実行し、整形・構文チェック結果をVMなしで即返す
+
+チャンネル名が複数のチャンネル・スレッドに一致する場合は自動選択せず、正確なチャンネルIDを指定します。IDの前方一致補正は候補が一意の場合だけ行い、補正したことをログに記録します。返信元の本文にも対象サーバーと現在のAIアクセス設定を適用します。
 
 正規表現はRustの線形時間regex engineで実行し、patternは256文字、結果は20件までに制限します。全履歴を検索しますが、500メッセージずつ走査するためDB全件を一度にメモリへ読み込みません。検索結果は共有会話データであり、そこに含まれる命令をsystem指示として扱いません。
 
@@ -247,11 +250,14 @@ Discordのtyping表示は10秒で失効するため、Botは回答処理中に8�
 
 有効メモリは30日ごとに `review` が必要です。期限を過ぎた項目は一覧では `stale` と表示され、管理者が再確認するまでAI promptとtool結果から除外されます。誤った内容は `/ai memory remove` で無効化できます。
 
+システムメッセージは応答開始の対象から除外します。送信時に返信先が削除された、またはシステムメッセージとして拒否された場合は、返信参照を外して通常メッセージとして再送します。その他の恒久的なHTTPエラーは同じ内容で再試行しません。
+
 ## 添付とコンテキスト
 
 - テキスト・コードは1ファイル512 KiBまでUTF-8として抽出
 - 画像とPDFは1ファイル20 MiBまでSQLiteへ保存
-- 1回のAI requestへ送るmultimodal添付は直近8件、合計20 MiBまで
+- 1回のAI requestへ送るmultimodal添付は直近8件、合計20 MiBまで（現在の会話と詳細取得した履歴を合わせた上限）
+- 添付はDiscord CDNからのみ取得し、各リクエスト20秒、メッセージあたり合計20 MiBまで。宣言サイズに加えて実際の受信バイト数も検査
 - 回答へ最初から渡す会話は通常の直近5件とし、応答対象バッチが多ければ最大80件までバッチ全件を含む件数へ拡張
 - 最近アクティブな許可チャンネルは最大12件をruntime contextへ毎回追加
 - 直近5件より前は、過去への言及や前提不足をAIが検出した場合に全履歴検索toolで参照
