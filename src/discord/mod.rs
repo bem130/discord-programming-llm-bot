@@ -1036,6 +1036,14 @@ impl DiscordBot {
         channel_id: u64,
         message_id: u64,
     ) -> crate::model::ReferencedMessage {
+        if let Ok(Some(cached)) = self
+            .database
+            .get_allowed_message_by_discord_id(self.guild_id.get(), message_id)
+            .await
+            && cached.channel_id == channel_id
+        {
+            return cached;
+        }
         match (DiscordHistoryReader {
             database: &self.database,
             http: &context.http,
@@ -2015,6 +2023,7 @@ mod tests {
                         Err(error) => panic!("mock accept failed: {error}"),
                     }
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
@@ -2147,7 +2156,7 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             let mut buffer = [0; 4096];
-            stream.read(&mut buffer).unwrap();
+            assert!(stream.read(&mut buffer).unwrap() > 0);
             stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\n1234\r\n4\r\n5678\r\n0\r\n\r\n").unwrap();
         });
         let response = reqwest::Client::builder()

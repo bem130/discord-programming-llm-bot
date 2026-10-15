@@ -2772,6 +2772,18 @@ mod tests {
                         .unwrap();
                     let image_index = request.messages.iter().position(|message| matches!(&message.content, PromptContent::Parts(parts) if parts.iter().any(|part| matches!(part, crate::ai::ContentPart::ImageUrl { .. })) && parts.iter().any(|part| matches!(part, crate::ai::ContentPart::File { .. })))).unwrap();
                     assert!(result_index < image_index);
+                    let media_count: usize = request
+                        .messages
+                        .iter()
+                        .map(|message| match &message.content {
+                            PromptContent::Parts(parts) => parts
+                                .iter()
+                                .filter(|part| !matches!(part, crate::ai::ContentPart::Text { .. }))
+                                .count(),
+                            _ => 0,
+                        })
+                        .sum();
+                    assert_eq!(media_count, 8);
                     Ok(crate::ai::ModelResponse {
                         content: Some("read attachments".into()),
                         tool_calls: vec![],
@@ -2780,13 +2792,23 @@ mod tests {
             }
         }
         let database = Database::connect("sqlite::memory:").await.unwrap();
-        let mut messages = vec![PromptMessage::user("read the old attachment")];
+        let mut current = context_message(11);
+        current.attachments = (0..8)
+            .map(|index| crate::model::ContextAttachment {
+                filename: format!("current-{index}.png"),
+                content_type: Some("image/png".into()),
+                extracted_text: None,
+                binary_data: Some(vec![7, 8, 9]),
+            })
+            .collect();
+        let context = vec![current];
+        let mut messages = vec![crate::context::context_data_message(&context)];
         let answer = generate_with_tools(
             &Model(Mutex::new(0)),
             &database,
             &runtime_context(),
             1,
-            &[],
+            &context,
             &mut messages,
             None,
             None,
