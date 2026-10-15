@@ -169,25 +169,35 @@ impl Database {
         guild_id: u64,
         channel_id: u64,
         settings_channel_id: u64,
+        last_synced_message_id: Option<u64>,
     ) -> Result<()> {
         sqlx::query(
             r#"
             INSERT INTO channel_history_sync (
-                guild_id, channel_id, settings_channel_id, completed
-            ) VALUES (?, ?, ?, 1)
+                guild_id, channel_id, settings_channel_id, completed, last_synced_message_id
+            ) VALUES (?, ?, ?, 1, ?)
             ON CONFLICT (guild_id, channel_id) DO UPDATE SET
                 settings_channel_id = excluded.settings_channel_id,
                 completed = 1,
+                last_synced_message_id = excluded.last_synced_message_id,
                 updated_at = CURRENT_TIMESTAMP
             "#,
         )
         .bind(guild_id.to_string())
         .bind(channel_id.to_string())
         .bind(settings_channel_id.to_string())
+        .bind(last_synced_message_id.map(|id| id.to_string()))
         .execute(&self.writer)
         .await
         .context("failed to mark channel history sync complete")?;
         Ok(())
+    }
+
+    pub async fn history_sync_cursor(&self, guild_id: u64, channel_id: u64) -> Result<Option<u64>> {
+        let cursor = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT last_synced_message_id FROM channel_history_sync WHERE guild_id = ? AND channel_id = ? AND completed = 1",
+        ).bind(guild_id.to_string()).bind(channel_id.to_string()).fetch_optional(&self.pool).await?.flatten();
+        cursor.map(parse_id).transpose()
     }
 
     pub async fn channel_settings(&self, guild_id: u64) -> Result<Vec<ChannelSetting>> {
@@ -1455,9 +1465,12 @@ mod tests {
             .set_channel_mode(1, 2, ChannelMode::ReadOnly, 3)
             .await
             .unwrap();
-        database.mark_history_sync_completed(1, 2, 2).await.unwrap();
         database
-            .mark_history_sync_completed(1, 20, 2)
+            .mark_history_sync_completed(1, 2, 2, None)
+            .await
+            .unwrap();
+        database
+            .mark_history_sync_completed(1, 20, 2, None)
             .await
             .unwrap();
         assert!(database.history_sync_completed(1, 2).await.unwrap());

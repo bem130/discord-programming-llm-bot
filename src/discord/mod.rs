@@ -476,7 +476,7 @@ impl EventHandler for DiscordBot {
     }
 
     async fn message(&self, context: Context, message: Message) {
-        if message.author.bot || message.guild_id != Some(self.guild_id) {
+        if message.guild_id != Some(self.guild_id) {
             return;
         }
 
@@ -611,7 +611,7 @@ impl DiscordBot {
                 author_id: message.author.id.get(),
                 author_name: message.author.name.clone(),
                 content: message.content.clone(),
-                is_bot: false,
+                is_bot: message.author.bot,
                 created_at: message.timestamp.to_string(),
                 referenced_message_id,
                 referenced_message: referenced_message.clone(),
@@ -619,7 +619,10 @@ impl DiscordBot {
             })
             .await?;
 
-        if mode == crate::model::ChannelMode::ReadOnly || !can_reply_to(message.kind) {
+        if message.author.bot
+            || mode == crate::model::ChannelMode::ReadOnly
+            || !can_reply_to(message.kind)
+        {
             return Ok(());
         }
         let bot_user_id = self.bot_user_id.load(Ordering::Relaxed);
@@ -1093,7 +1096,8 @@ impl MessageHistoryReader for DiscordHistoryReader<'_> {
             .await?;
         // REST message objects can omit guild_id; the channel above establishes the guild.
         anyhow::ensure!(
-            message.channel_id == channel_id
+            message.id.get() == message_id
+                && message.channel_id == channel_id
                 && message.guild_id.is_none_or(|guild| guild == self.guild_id),
             "message belongs to another channel or server"
         );
@@ -1631,7 +1635,7 @@ async fn add_archived_thread_pages(
                     thread
                         .thread_metadata
                         .as_ref()
-                        .map(|metadata| metadata.archive_timestamp)
+                        .and_then(|metadata| metadata.archive_timestamp)
                 })
                 .min()
                 .map(|timestamp| timestamp.to_string())
@@ -1645,9 +1649,13 @@ async fn add_archived_thread_pages(
                 },
             );
         }
-        if !threads.has_more || oldest == before || oldest.is_none() {
+        if !threads.has_more {
             break;
         }
+        anyhow::ensure!(
+            oldest.is_some() && oldest != before,
+            "archived thread pagination did not advance"
+        );
         before = oldest;
     }
     Ok(())
@@ -1659,21 +1667,29 @@ async fn sync_channel_history(
     guild_id: GuildId,
     target: HistoryTarget,
 ) -> Result<usize> {
-    let channel_name = target
-        .channel_id
-        .to_channel(http)
-        .await
-        .ok()
-        .and_then(|channel| match channel {
-            Channel::Guild(channel) => Some(channel.name),
-            _ => None,
-        });
+    let Channel::Guild(channel) = target.channel_id.to_channel(http).await? else {
+        anyhow::bail!("history target is not a guild channel");
+    };
+    anyhow::ensure!(
+        channel.guild_id == guild_id
+            && inherited_settings_channel_id(channel.id, channel.parent_id, channel.kind)
+                == target.settings_channel_id,
+        "history target does not match its guild or settings channel"
+    );
+    anyhow::ensure!(
+        database
+            .channel_mode(guild_id.get(), target.settings_channel_id.get())
+            .await?
+            .stores_messages(),
+        "history target no longer allows AI access"
+    );
+    let channel_name = Some(channel.name);
     let completed = database
         .history_sync_completed(guild_id.get(), target.channel_id.get())
         .await?;
-    let count = if completed {
+    let (count, last_synced) = if completed {
         match database
-            .latest_message_id(guild_id.get(), target.channel_id.get())
+            .history_sync_cursor(guild_id.get(), target.channel_id.get())
             .await?
         {
             Some(after) => {
@@ -1700,6 +1716,7 @@ async fn sync_channel_history(
             guild_id.get(),
             target.channel_id.get(),
             target.settings_channel_id.get(),
+            last_synced,
         )
         .await?;
     Ok(count)
@@ -1711,9 +1728,10 @@ async fn sync_messages_before(
     guild_id: GuildId,
     target: HistoryTarget,
     channel_name: Option<&str>,
-) -> Result<usize> {
+) -> Result<(usize, Option<u64>)> {
     let mut before = None;
     let mut recorded = 0;
+    let mut newest = None;
     loop {
         let mut builder = GetMessages::new().limit(100);
         if let Some(before_id) = before {
@@ -1724,6 +1742,7 @@ async fn sync_messages_before(
             break;
         }
         messages.sort_unstable_by_key(|message| message.id.get());
+        newest = newest.or_else(|| messages.last().map(|message| message.id.get()));
         let next_before = messages[0].id.get();
         for message in &messages {
             record_historical_message(database, guild_id, target, channel_name, message).await?;
@@ -1734,7 +1753,7 @@ async fn sync_messages_before(
         }
         before = Some(next_before);
     }
-    Ok(recorded)
+    Ok((recorded, newest))
 }
 
 async fn sync_messages_after(
@@ -1744,7 +1763,7 @@ async fn sync_messages_after(
     target: HistoryTarget,
     channel_name: Option<&str>,
     after: u64,
-) -> Result<usize> {
+) -> Result<(usize, Option<u64>)> {
     let mut after = after;
     let mut recorded = 0;
     loop {
@@ -1773,7 +1792,7 @@ async fn sync_messages_after(
             break;
         }
     }
-    Ok(recorded)
+    Ok((recorded, Some(after)))
 }
 
 async fn record_historical_message(
@@ -1783,6 +1802,18 @@ async fn record_historical_message(
     channel_name: Option<&str>,
     message: &Message,
 ) -> Result<()> {
+    anyhow::ensure!(
+        message.channel_id == target.channel_id
+            && message.guild_id.is_none_or(|guild| guild == guild_id),
+        "historical message belongs to another channel or guild"
+    );
+    anyhow::ensure!(
+        database
+            .channel_mode(guild_id.get(), target.settings_channel_id.get())
+            .await?
+            .stores_messages(),
+        "history target no longer allows AI access"
+    );
     let referenced_message_id = message
         .message_reference
         .as_ref()
@@ -2052,6 +2083,90 @@ mod tests {
         message.author.id = serenity::all::UserId::new(3);
         message.content = "history message".into();
         message
+    }
+
+    #[tokio::test]
+    async fn history_sync_does_not_skip_a_gap_when_newer_messages_are_already_cached() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        database
+            .set_channel_mode(1, 2, crate::model::ChannelMode::ReadOnly, 3)
+            .await
+            .unwrap();
+        let mut cached = test_message();
+        cached.id = MessageId::new(300);
+        let target = HistoryTarget {
+            channel_id: ChannelId::new(2),
+            settings_channel_id: ChannelId::new(2),
+        };
+        record_historical_message(&database, GuildId::new(1), target, None, &cached)
+            .await
+            .unwrap();
+        database
+            .mark_history_sync_completed(1, 2, 2, Some(100))
+            .await
+            .unwrap();
+        let mut missing = test_message();
+        missing.id = MessageId::new(200);
+        let (http, server) = mock_http(vec![
+            (
+                200,
+                serde_json::json!({"id":"2","guild_id":"1","type":0,"name":"history"}),
+            ),
+            (200, serde_json::to_value(vec![cached, missing]).unwrap()),
+        ]);
+        assert_eq!(
+            sync_channel_history(&http, &database, GuildId::new(1), target)
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(
+            database
+                .message_context_by_id(1, 200)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(database.history_sync_cursor(1, 2).await.unwrap(), Some(300));
+        let requests = server.join().unwrap();
+        let url = reqwest::Url::parse(&format!("http://localhost{}", requests[1].0)).unwrap();
+        assert_eq!(
+            url.query_pairs().find(|(key, _)| key == "after").unwrap().1,
+            "100"
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_body_limits_check_actual_download_size() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut buffer = [0; 4096];
+            stream.read(&mut buffer).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\n1234\r\n4\r\n5678\r\n0\r\n\r\n").unwrap();
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            read_attachment_response(response, 5)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("byte limit")
+        );
+        server.join().unwrap();
     }
 
     #[tokio::test]
