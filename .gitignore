@@ -17,3 +17,10 @@ Thumbs.db
 *.log
 /data/*
 !/data/.gitkeep
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+/logs/

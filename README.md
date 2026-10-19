@@ -1,5 +1,11 @@
 # Discord Learn Programming Bot
 
+[MIT License](LICENSE) · [Security policy](SECURITY.md) · [Publication review](docs/publication-review.md)
+
+LinuxでのビルドにはOpenSSLの開発パッケージとpkg-configも必要です
+（Ubuntu: `sudo apt-get install libssl-dev pkg-config`）。SerenityのTLS接続には
+OSの証明書ストアを使うnative TLS backendを使用します。
+
 指定した1つのDiscordサーバーに常駐し、サーバー内で共有した会話コンテキストを使ってプログラミング学習を支援するRust製Botです。OpenRouter経由の既定モデルは `openai/gpt-5.6-luna` です。
 
 ## 実装済み機能

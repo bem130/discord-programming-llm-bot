@@ -21,12 +21,15 @@ serenity = { version = "0.12", default-features = false, features = [
     "gateway",
     "http",
     "model",
-    "rustls_backend",
+    # Serenity 0.12 uses an unpatched rustls 0.22 through its WebSocket backend.
+    # Use the supported native TLS backend; keep reqwest's Rustls feature patched too.
+    "native_tls_backend",
 ] }
 sqlx = { version = "0.8", default-features = false, features = [
     "macros",
     "migrate",
-    "runtime-tokio-rustls",
+    # SQLite does not need a TLS backend.
+    "runtime-tokio",
     "sqlite",
 ] }
 thiserror = "2"

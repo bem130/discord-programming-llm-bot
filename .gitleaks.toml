@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Known dummy guild ID used in setup examples; not a credential"
+regexTarget = "secret"
+regexes = ['^123456789012345678$']
