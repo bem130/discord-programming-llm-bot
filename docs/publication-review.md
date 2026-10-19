@@ -61,3 +61,18 @@ push, pull requests, and a weekly schedule. Third-party Actions use pinned commi
 IDs; the Gitleaks download uses a pinned version and SHA-256 digest. CI needs no
 Discord token or OpenRouter API key. Private vulnerability reporting is enabled
 on the publication repository.
+
+## Local validation
+
+`cargo fmt --check`, `cargo test --locked` (126 passed, one opt-in Lima test
+ignored), and `cargo clippy --locked --all-targets --all-features -- -D warnings`
+passed on Windows. Dependency checks and the history/staged-content secret scans
+also passed.
+
+The first full test run overlapped Clippy compilation and failed the SQLite
+concurrent-write stress test with a pool acquisition timeout. With compilation
+finished, both that test alone and the complete test suite passed. The test took
+approximately 90–95 seconds on this machine; a synthetic ten-flush check on D:
+took 4.33 seconds. The C: volume had no free space, so temporary files and build
+caches were placed on D:. This exposes sensitivity to storage load; it does not
+establish a guarantee for overloaded production hosts.
